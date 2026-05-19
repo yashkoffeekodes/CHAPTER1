@@ -1,0 +1,11 @@
+langchain
+langchain-community
+langchain-nvidia-ai-endpoints
+langchain-core
+langchain-chroma
+langgraph
+langgraph-checkpoint-sqlite
+langgraph-prebuilt
+langgraph-sdk
+langgraph-cli[inmem]
+ipython

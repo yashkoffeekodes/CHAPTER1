@@ -1,0 +1,16 @@
+from langchain_nvidia_ai_endpoints import ChatNVIDIA, NVIDIAEmbeddings
+from dotenv import load_dotenv
+import os
+
+
+try:
+    load_dotenv()
+
+    NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+
+    llm = ChatNVIDIA(model="openai/gpt-oss-120b",api_key=NVIDIA_API_KEY)
+    print(llm.invoke("Helo").content)
+    embedding_model = NVIDIAEmbeddings(model="nvidia/nv-embedqa-e5-v5", api_key=NVIDIA_API_KEY)
+    print("Embedding model and LLM loaded successfully!")
+except Exception as e:
+    print(f"Error loading models: {e}")
