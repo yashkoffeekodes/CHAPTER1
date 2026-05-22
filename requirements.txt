@@ -9,3 +9,5 @@ langgraph-prebuilt
 langgraph-sdk
 langgraph-cli[inmem]
 ipython
+fastapi
+uvicorn

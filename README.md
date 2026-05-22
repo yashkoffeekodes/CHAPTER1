@@ -1,16 +1,21 @@
 # Chapter1 AI Assistant
 
-An asynchronous **ERP & Accounting AI Assistant** built with **LangGraph**, **LangChain**, **NVIDIA AI Endpoints**, and **ChromaDB**.
+An asynchronous **ERP & Accounting AI Assistant** built with **LangGraph**, **LangChain**, **FastAPI**, **NVIDIA AI Endpoints**, and **ChromaDB**.
 
-The assistant understands a user's ERP/accounting query, semantically retrieves only the relevant tools, binds those tools to the LLM, executes the needed tool calls, and returns a concise answer based on structured ERP data.
+The assistant understands ERP/accounting queries, breaks multi-intent questions into smaller semantic parts, retrieves relevant ERP tools, binds only those tools to the LLM, executes tool calls, and returns a structured **dynamic JSON response** suitable for API/frontend usage.
 
 ---
 
 ## Features
 
 - **LangGraph workflow** for structured agent execution
+- **FastAPI backend** with a `/chat` endpoint
+- **Dynamic JSON API responses** instead of markdown text
 - **Semantic tool retrieval** using ChromaDB vector search
+- **Multi-intent query decomposition** before semantic retrieval
 - **Dynamic tool binding** so the LLM only receives relevant tools
+- **Few-shot worker prompt** for better multi-tool calling and filtering
+- **Strict filtering rules** to avoid returning unrelated ERP records
 - **Async execution** using `async` / `await`
 - **Supervisor routing node** to decide whether to finish, retry, or call tools
 - **ToolNode integration** for executing LangChain tools
@@ -32,27 +37,33 @@ This project acts like an ERP assistant that can answer questions such as:
 - Check sale returns for a customer
 - Find HSN, GST, CGST, SGST, and IGST details
 - Show bill/payment terms
+- Answer multiple ERP questions in a single query
 
-Instead of giving all tools to the LLM every time, the system first performs **semantic search over tool descriptions** and only binds the tools that match the user's query.
+Instead of giving all tools to the LLM every time, the system first retrieves relevant tools from ChromaDB and binds only those tools to the model.
 
 ---
 
-## Architecture
+## Updated Architecture
 
 ```text
-User Query
+User / Postman / Frontend
    |
    v
-Initial State
+FastAPI /chat endpoint
+   |
+   v
+Initial LangGraph State
    |
    v
 Semantic Search Node
-   |  - Searches ChromaDB tool cards
+   |  - Splits multi-intent query into smaller parts
+   |  - Searches ChromaDB tool cards for each part
    |  - Returns relevant tool names
    v
 Worker / Chatbot Node
    |  - Binds selected tools to the LLM
-   |  - Generates answer or tool calls
+   |  - Uses few-shot prompt for tool calling + JSON output
+   |  - Generates tool calls or final JSON response
    v
 Supervisor Node
    |  - If tool calls exist -> route to Tools Node
@@ -61,24 +72,26 @@ Supervisor Node
    v
 Tools Node
    |  - Executes selected ERP tools
+   |  - Tools return JSON strings from dummy ERP data
    v
 Worker Node
    |
    v
-Final Answer
+Structured Dynamic JSON Response
 ```
 
 ---
 
 ## Graph Flow
 
-The LangGraph workflow contains three main nodes:
+The LangGraph workflow contains these main nodes:
 
 | Node | Purpose |
 |---|---|
 | `semantic_node` | Retrieves the most relevant tools based on the user query |
-| `worker_node` | Binds retrieved tools to the LLM and generates tool calls or final response |
+| `worker_node` | Binds retrieved tools to the LLM and generates tool calls or final JSON response |
 | `tools_node` | Executes LangChain tools through `ToolNode` |
+| `supervisor_node` | Routes between worker, tools, retry, and finish |
 
 The flow is:
 
@@ -113,12 +126,15 @@ worker_node -> worker_node
 ## Tech Stack
 
 - Python 3.11+
+- FastAPI
+- Uvicorn
 - LangChain
 - LangGraph
 - LangGraph Prebuilt `ToolNode`
 - LangChain Chroma
 - ChromaDB
 - NVIDIA AI Endpoints
+- NVIDIA Embeddings
 - Pydantic
 - python-dotenv
 
@@ -126,32 +142,33 @@ worker_node -> worker_node
 
 ## Folder Structure
 
-Recommended structure for this project:
+Recommended structure:
 
 ```text
 chapter1_assist/
 │
-├── main.py
+├── fast_main.py              # FastAPI backend
+├── main.py                   # Optional terminal runner
 ├── .env
 ├── requirements.txt
 ├── README.md
 │
-├── chroma_db/                 # Auto-created vector database
+├── chroma_db/                # Auto-created vector database
 │
 └── src/
     ├── __init__.py
-    ├── config.py              # LLM and embedding model setup
-    ├── dummy.py               # Dummy ERP/accounting data
-    ├── graphs.py              # LangGraph builder
-    ├── nodes.py               # Semantic search, chatbot, and supervisor nodes
-    ├── retriever.py           # Semantic tool retriever
-    ├── schema.py              # TypedDict and Pydantic state schemas
-    ├── tool.py                # LangChain tool definitions
-    ├── tool_doc.py            # Tool cards used for semantic search
-    └── vectorstore.py         # Chroma vector store setup
+    ├── config.py             # LLM and embedding model setup
+    ├── dummy.py              # Dummy ERP/accounting data
+    ├── graphs.py             # LangGraph builder
+    ├── nodes.py              # Semantic search, chatbot, and supervisor nodes
+    ├── retriever.py          # Multi-intent semantic tool retriever
+    ├── schema.py             # TypedDict and Pydantic state schemas
+    ├── tool.py               # LangChain tool definitions
+    ├── tool_doc.py           # Tool cards used for semantic search
+    └── vectorstore.py        # Chroma vector store setup
 ```
 
-> Note: Make sure your local filenames match the imports. For example, use `main.py`, `graphs.py`, `nodes.py`, and `schema.py` instead of files with names like `main(2).py` or `graphs(2).py`.
+> Note: Make sure your local filenames match the imports. For example, use `fast_main.py`, `graphs.py`, `nodes.py`, and `schema.py` instead of files with names like `fast_main(2).py` or `graphs(2).py`.
 
 ---
 
@@ -189,6 +206,8 @@ pip install -r requirements.txt
 If you do not have a `requirements.txt` yet, create one with:
 
 ```txt
+fastapi
+uvicorn
 langchain
 langchain-core
 langchain-community
@@ -242,7 +261,7 @@ embedding_model = NVIDIAEmbeddings(
 )
 ```
 
-You can replace the model name with any supported NVIDIA AI Endpoint model that supports tool calling and instruction following.
+Important: avoid calling `llm.invoke()` inside `config.py`. `config.py` should only create model and embedding objects. Test the model from a separate test file to avoid import-time crashes.
 
 ---
 
@@ -258,6 +277,7 @@ Example:
 Document(
     page_content="""
     Tool: get_sale_info
+
     Use this tool when the user asks about sales information,
     sale invoice, customer, buyer, sale amount, taxable amount,
     GST in sales, outstanding amount, bill-to details, ship-to details,
@@ -280,83 +300,287 @@ vectore_store = Chroma.from_documents(
 )
 ```
 
-### 3. Retriever selects tools
+### 3. Retriever splits multi-intent queries
 
-`retriever.py` performs async similarity search:
+The retriever now breaks a query into smaller parts before semantic search.
 
-```python
-retriver_tools = await vectore_store.asimilarity_search(query, k=k)
+Example query:
+
+```text
+Show sales invoices for Account, receipt vouchers with CASH mode, and bill terms for pen00001.
 ```
 
-Then it maps matched tool cards back to actual LangChain tool objects.
+Detected parts:
 
-### 4. Worker node binds only selected tools
+```python
+[
+    "Show sales invoices for Account",
+    "receipt vouchers with CASH mode",
+    "bill terms for pen00001"
+]
+```
 
-The chatbot node gets the retrieved tool names and binds only those tools:
+Each part is searched separately in ChromaDB. This improves multi-tool retrieval compared to searching the full query only once.
+
+### 4. Worker node binds selected tools
+
+The chatbot node receives retrieved tool names and binds only those tools:
 
 ```python
 llm_with_tools = llm.bind_tools(tools_list)
 ```
 
-This keeps the LLM focused and reduces unnecessary tool confusion.
+If no tools are retrieved, the node safely falls back to the plain LLM:
 
-### 5. Supervisor controls routing
+```python
+llm_with_tools = llm
+```
 
-The supervisor checks whether:
+### 5. Worker prompt uses few-shot examples
 
-- the model requested tool calls,
-- the response is complete,
-- the worker should retry,
-- or the graph should end.
+The worker prompt includes examples such as:
+
+```text
+User query: Find all sales invoices where customer city is Silvassa, and show receipt vouchers where payment mode is CASH.
+Correct tools to call: get_sale_info, get_receipt
+Final JSON data keys: sales_invoices, receipt_vouchers
+```
+
+This improves:
+
+- multi-tool calling,
+- exact filtering,
+- dynamic JSON structure,
+- and avoiding markdown responses.
+
+### 6. Final output is dynamic JSON
+
+The assistant returns structured JSON instead of markdown text.
+
+General structure:
+
+```json
+{
+  "response": {
+    "success": true,
+    "query": "original user query",
+    "data": {
+      "dynamic_section_name": []
+    },
+    "summary": "short factual summary"
+  }
+}
+```
+
+The keys inside `data` are dynamic and depend on the user query, such as:
+
+```text
+sales_invoices
+receipt_vouchers
+purchase_invoices
+payment_vouchers
+sale_returns
+hsn_tax_details
+bill_terms
+totals
+```
 
 ---
 
-## Running the Project
+## Running the FastAPI Backend
 
-Run the application:
+Run:
 
 ```bash
-python main.py
+python fast_main.py
 ```
 
-The current `main.py` contains a sample query:
+Or:
 
-```python
-query = "ભાઈ, 'Silvassa' city na jetla bhee sales invoices chhe ae to batavo, and sath ma e bhee check karo ke 'ABC Ltd' na ketla sale return thaya chhe?"
+```bash
+uvicorn fast_main:app --reload
 ```
 
-You can replace it with your own query:
+The API will run at:
 
-```python
-query = "Show sales invoices from Silvassa and receipt vouchers paid by CASH."
+```text
+http://127.0.0.1:8000
+```
+
+Health check:
+
+```text
+GET http://127.0.0.1:8000/
+```
+
+Chat endpoint:
+
+```text
+POST http://127.0.0.1:8000/chat
 ```
 
 ---
 
-## Example Queries
+## Testing with Postman
+
+Use:
 
 ```text
-What is the HSN code and GST rate for pen00001?
+POST http://127.0.0.1:8000/chat
 ```
 
-```text
-Show me all sales invoices where the customer city is Silvassa.
-```
+Headers:
 
 ```text
-Have we made any payments to rohan through ONLINE mode?
+Content-Type: application/json
 ```
 
-```text
-Show receipt vouchers where payment mode was CASH.
+Body → raw → JSON:
+
+```json
+{
+  "query": "Find all sales invoices where customer city is Silvassa, and show receipt vouchers where payment mode is CASH."
+}
 ```
 
-```text
-Customer rohan ke naam par jitni bhi sales invoices hain wo dikhao aur receipts bhi check karo.
+Example response:
+
+```json
+{
+  "response": {
+    "success": true,
+    "query": "Find all sales invoices where customer city is Silvassa, and show receipt vouchers where payment mode is CASH.",
+    "data": {
+      "sales_invoices": [
+        {
+          "invoice_no": "SL-3",
+          "invoice_date": "2025-07-10",
+          "customer_name": "Account",
+          "city": "Silvassa",
+          "net_amount": 1111
+        }
+      ],
+      "receipt_vouchers": [
+        {
+          "invoice_no": "SO-12",
+          "date": "2025-06-30",
+          "amount": 20000,
+          "reference_mode": "CASH"
+        }
+      ]
+    },
+    "summary": "Found matching sales invoices and receipt vouchers."
+  }
+}
 ```
 
-```text
-Find all sale returns for ABC Ltd.
+---
+
+## FastAPI Response Model
+
+The API uses a dynamic response model:
+
+```python
+from typing import Any
+from pydantic import BaseModel, Field
+
+class DynamicERPResponse(BaseModel):
+    success: bool = True
+    query: str
+    data: dict[str, Any] = Field(default_factory=dict)
+    summary: str | None = None
+
+class ChatResponse(BaseModel):
+    response: DynamicERPResponse
+```
+
+Do not use this for the final JSON version:
+
+```python
+class ChatResponse(BaseModel):
+    response: str
+```
+
+That will cause a validation error because the response is now a dictionary, not a string.
+
+---
+
+## Example Multi-Tool Queries
+
+### 2-tool queries
+
+```json
+{
+  "query": "Find all sales invoices where customer city is Silvassa, and show receipt vouchers where payment mode is CASH."
+}
+```
+
+```json
+{
+  "query": "Get HSN code, GST rate, CGST and SGST for pen00001, and also show its bill term."
+}
+```
+
+```json
+{
+  "query": "Show purchase invoices for Dddsdss and payment vouchers made to rohan."
+}
+```
+
+### 3-tool queries
+
+```json
+{
+  "query": "Show sales invoices for Account, receipt vouchers with CASH mode, and bill terms for pen00001."
+}
+```
+
+```json
+{
+  "query": "Find sales invoices for rohan, receipt vouchers from rohan, and payment vouchers related to rohan."
+}
+```
+
+### 4-tool queries
+
+```json
+{
+  "query": "Show sale returns for Account, sales invoices for Account, receipt vouchers with CASH mode, and bill terms for pen00001."
+}
+```
+
+```json
+{
+  "query": "Show purchase invoices for Dddsdss, sales invoices for Account, payment vouchers for rohan, and receipt vouchers with CASH mode."
+}
+```
+
+### Stress test
+
+```json
+{
+  "query": "Show purchase invoices for Dddsdss, sales invoices for Account, receipt vouchers with CASH mode, payment vouchers for rohan, HSN details for pen00001, and bill terms for pen00001."
+}
+```
+
+### Hindi/Gujarati mixed queries
+
+```json
+{
+  "query": "Account ke naam par jitni sales invoices hain wo dikhao, aur CASH mode ke receipt vouchers bhi show karo."
+}
+```
+
+```json
+{
+  "query": "pen00001 ka HSN, GST, CGST, SGST dikhao aur uska bill term bhi batao."
+}
+```
+
+```json
+{
+  "query": "Silvassa city na sales invoices batavo ane CASH mode na receipt vouchers pan show karo."
+}
 ```
 
 ---
@@ -365,7 +589,7 @@ Find all sale returns for ABC Ltd.
 
 ### Dynamic tool binding
 
-The project does not bind all tools every time. It retrieves only the most relevant tools first, then binds those tools to the model.
+The project does not bind all tools every time. It retrieves relevant tools first, then binds those tools to the model.
 
 This improves:
 
@@ -374,12 +598,41 @@ This improves:
 - model focus,
 - and multi-tool query handling.
 
+### Multi-intent retrieval
+
+The retriever splits long queries into smaller parts and searches each part separately.
+
+This helps the assistant retrieve tools for queries such as:
+
+```text
+sales invoices + receipts + bill terms
+```
+
+instead of only retrieving the strongest single matching tool.
+
+### Dynamic JSON output
+
+The final answer is designed for APIs and frontends.
+
+The worker prompt forces the final response to be:
+
+- valid raw JSON,
+- no markdown,
+- no bullet points,
+- no code fences,
+- dynamic `data` keys,
+- and strict filtering based on the user's query.
+
 ### Async-first design
 
 The graph uses async execution:
 
 ```python
-async for chunk in chatbot_graph.astream(initial_state, stream_mode="updates"):
+async for chunk in chatbot_graph.astream(
+    initial_state,
+    config=config,
+    stream_mode="updates"
+):
 ```
 
 This makes the architecture easier to extend later with real APIs, databases, or external ERP services.
@@ -399,61 +652,137 @@ For production, replace the dummy data with:
 
 ## Common Issues
 
-### 1. `ModuleNotFoundError: No module named 'src'`
+### 1. `422 Unprocessable Entity`
 
-Make sure you run the project from the root directory:
+This usually means the Postman body is wrong.
 
-```bash
-cd chapter1_assist
-python main.py
+Correct request body:
+
+```json
+{
+  "query": "Show sales invoices for Account."
+}
 ```
 
-Also make sure `src/__init__.py` exists.
+Make sure Postman uses:
+
+```text
+Body -> raw -> JSON
+Content-Type: application/json
+```
 
 ---
 
-### 2. NVIDIA API key not found
+### 2. Pydantic validation error: response should be a string
 
-Check that your `.env` file exists and contains:
+If you see:
 
-```env
-NVIDIA_API_KEY=your_key_here
+```text
+Input should be a valid string
+```
+
+then your FastAPI response model is still:
+
+```python
+class ChatResponse(BaseModel):
+    response: str
+```
+
+Change it to:
+
+```python
+class ChatResponse(BaseModel):
+    response: DynamicERPResponse
 ```
 
 ---
 
-### 3. ChromaDB not loading correctly
+### 3. NVIDIA `502 Bad Gateway`
+
+This is usually an upstream NVIDIA endpoint/provider issue.
+
+Avoid calling:
+
+```python
+llm.invoke("Hello")
+```
+
+inside `config.py`, because that can break app startup during imports.
+
+Use a separate test file instead.
+
+---
+
+### 4. `ImportError: cannot import name 'embedding_model'`
+
+This can happen if `config.py` fails before creating `embedding_model`.
+
+Keep `config.py` simple:
+
+```python
+llm = ChatNVIDIA(...)
+embedding_model = NVIDIAEmbeddings(...)
+```
+
+Do not make live model calls inside `config.py`.
+
+---
+
+### 5. ChromaDB not loading correctly
 
 Delete the existing `chroma_db` folder and run the app again:
 
 ```bash
 rm -rf chroma_db
-python main.py
+python fast_main.py
 ```
 
 The vector store will be recreated.
 
 ---
 
-### 4. Tool is not selected correctly
+### 6. Tool is not selected correctly
 
 Improve the descriptions in `tool_doc.py`. Semantic retrieval depends heavily on how clearly each tool card describes when that tool should be used.
+
+For multi-intent queries, also check terminal logs:
+
+```text
+Query parts detected: [...]
+Final retrieved tool names: [...]
+```
+
+---
+
+### 7. Model returns markdown instead of JSON
+
+Strengthen the worker prompt with:
+
+```text
+Return ONLY valid raw JSON.
+Do not return markdown.
+Do not wrap JSON inside ```json or ```.
+```
+
+Also parse the final output in FastAPI using `json.loads()`.
 
 ---
 
 ## Future Improvements
 
 - Replace dummy ERP data with real database/API calls
-- Add SQLite checkpointing with `AsyncSqliteSaver`
+- Add SQLite/Postgres checkpointing
 - Add conversation memory and message summarization
 - Add human-in-the-loop approval for sensitive operations
 - Add authentication for ERP users
-- Add FastAPI backend
+- Add role-based ERP access control
 - Add Streamlit or React frontend
 - Add unit tests for retriever, tools, and graph routing
 - Add Docker support
-- Add logging with structured traces
+- Add structured logging
 - Add LangSmith tracing
+- Add retry handling for temporary NVIDIA endpoint failures
+- Move filtering from the LLM layer into the API/database layer for production reliability
 
 ---
 
@@ -467,9 +796,12 @@ This project helps practice:
 - LLM tool calling
 - Semantic search
 - ChromaDB vector stores
+- FastAPI backend development
+- Dynamic JSON API design
 - NVIDIA LLM and embedding integration
 - Async agent workflows
 - Multi-tool retrieval
+- Few-shot prompting
 - ERP/accounting assistant design
 
 ---

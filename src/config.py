@@ -13,8 +13,6 @@ try:
     # llm = ChatNVIDIA(model="qwen/qwen3-next-80b-a3b-instruct",api_key=NVIDIA_API_KEY)
 
     # llm = ChatNVIDIA(model="meta/llama-3.3-70b-instruct",api_key=NVIDIA_API_KEY)
-
-    print(llm.invoke("Helo").content)
     embedding_model = NVIDIAEmbeddings(model="nvidia/nv-embedqa-e5-v5", api_key=NVIDIA_API_KEY)
     print("Embedding model and LLM loaded successfully!")
 except Exception as e:

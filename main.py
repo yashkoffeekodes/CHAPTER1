@@ -12,9 +12,9 @@ async def main():
         # query = "How many sales have we done in silvasa"
         # query = "What is the HSN code and GST rate for pen00001, and what are the total sales we have done for 'rohan'?"
         # query = "What are our total purchase amounts for 'Dddsdss', have we made any payments to 'rohan' via ONLINE mode, and what is the billing term name in our system?"
-        # query = "Find all sales invoices where the customer city is 'Silvassa', and also show me the receipt vouchers where the payment mode was 'CASH'."
+        query = "Find all sales invoices where the customer city is 'Silvassa', and also show me the receipt vouchers where the payment mode was 'CASH'."
         # query = "Customer 'rohan' ke naam par jitni bhi sales invoices hain wo dikhao, aur sath me check karo ki unse total kitna paisa receipt vouchers me receive hua hai."
-        query = "ભાઈ, 'Silvassa' city na jetla bhee sales invoices chhe ae to batavo, and sath ma e bhee check karo ke 'ABC Ltd' na ketla sale return thaya chhe?"
+        # query = "ભાઈ, 'Silvassa' city na jetla bhee sales invoices chhe ae to batavo, and sath ma e bhee check karo ke 'ABC Ltd' na ketla sale return thaya chhe?"
         initial_state = {
             "user_query": query,
             "messages": [HumanMessage(content=query)],
