@@ -1,4 +1,4 @@
-from src.vectorstore import vectore_store
+from src.vectorstore import vector_store,examples_store
 from src.tool import tools_dict
 import re
 
@@ -38,7 +38,7 @@ async def retriever(query: str, tools_registry: dict = tools_dict, k: int = 7):
         final_tool_names = []
 
         for part in query_parts:
-            docs = await vectore_store.asimilarity_search(part, k=2)
+            docs = await vector_store.asimilarity_search(part, k=2)
 
             tool_names = [
                 doc.metadata.get("tool_name")
@@ -59,12 +59,28 @@ async def retriever(query: str, tools_registry: dict = tools_dict, k: int = 7):
             for name in final_tool_names
             if name in tools_registry
         ]
+        
 
     except Exception as e:
         print(f"Error in retriever: {e}")
         return []
 
+async def retrieve_few_shot_examples(query: str, k: int = 2):
+    try:
+        print(f"Retrieving few-shot examples for: {query}")
+        docs = await examples_store.asimilarity_search(query, k=k)
 
+        formatted = ""
+        for doc in docs:
+            formatted += f"Q: {doc.page_content}\n"
+            formatted += f"A: {doc.metadata['output']}\n\n"
+
+        print(f"Injecting {len(docs)} few-shot examples")
+        return formatted
+
+    except Exception as e:
+        print(f"Error retrieving few-shot examples: {e}")
+        return ""  # fail silently — base prompt still works without examples
 
 
 # from src.vectorstore import vectore_store
