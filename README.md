@@ -1,4 +1,4 @@
-# ERP Assistant API
+# Chapter1_Assist
 
 An asynchronous **LangGraph-powered ERP and Accounting AI Assistant** with a **FastAPI backend**.
 
