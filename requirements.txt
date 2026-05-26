@@ -13,3 +13,4 @@ ipywidgets
 ipython
 langchain-ollama
 fastapi
+requests

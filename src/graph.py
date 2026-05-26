@@ -1,7 +1,7 @@
 from langgraph.graph import StateGraph, END, START
 from langgraph.prebuilt import tools_condition
 from src.schema import MainState,InputState, OutputState
-from src.nodes import semantic_search, chat_model_node, tools_node
+from src.nodes import semantic_search, chat_model_node, tools_node, routing_node,deterministic_final_node
 import time
 import inspect 
 
@@ -64,14 +64,16 @@ def graph_builder():
         builder.add_node("semantic_search", timed_node("semantic_search", semantic_search))
         builder.add_node("chat_model", timed_node("chat_model", chat_model_node))
         builder.add_node("tools", timed_node("tools", tools_node))
+        builder.add_node("deterministic_final", timed_node("deterministic_final", deterministic_final_node))
 
         builder.add_edge(START, "semantic_search")
         builder.add_edge("semantic_search", "chat_model")
-        builder.add_conditional_edges("chat_model", tools_condition,{
+        builder.add_conditional_edges("chat_model", routing_node,{
             "tools": "tools",
             "__end__": END
         })
-        builder.add_edge("tools", "chat_model")
+        builder.add_edge("tools", "deterministic_final")
+        builder.add_edge("deterministic_final", END)
 
         graph = builder.compile()   
     except Exception as e:
