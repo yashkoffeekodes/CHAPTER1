@@ -1,0 +1,13 @@
+langchain
+langchain-community
+langchain-core
+langchain-chroma
+langgraph
+langgraph-sdk
+langgraph-prebuilt
+langgraph-checkpoint-sqlite
+langgraph-cli[inmem]
+ipython
+langchain-ollama
+fastapi
+requests

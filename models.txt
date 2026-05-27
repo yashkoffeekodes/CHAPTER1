@@ -1,0 +1,88 @@
+glm4:9b
+granite4.1:8b
+qwen3:8b-q4_K_M
+hermes3:8b
+
+
+
+| Model              | Why try it?                                                                                                               | My verdict for your ERP assistant             |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| `llama3.1:8b`      | Good general model, multilingual, 128K context, tool-use support. ([Ollama][1])                                           | **Good fallback**                             |
+| `llama3.2:3b`      | Very fast, optimized for multilingual dialogue, agentic retrieval, summarization, and tool-use style tasks. ([Ollama][2]) | **Use as router only**                        |
+| `mistral-nemo:12b` | 12B model with 128K context; strong reasoning, knowledge, and coding for its size. ([Ollama][3])                          | **Good quality, slightly heavier**            |
+| `phi4-mini`        | 3.8B model with function-calling support. ([Ollama][4])                                                                   | **Fast test option**                          |
+| `gemma3:4b`        | Very lightweight, 128K context, supports 140+ languages. ([Ollama][5])                                                    | **Fast, but may be weaker for tools**         |
+| `gemma3:12b`       | Stronger than 4B, still smaller than your current 18 GB model; Ollama lists it around 8.1 GB. ([Ollama][6])               | **Worth testing**                             |
+| `gemma3n:e4b`      | Designed for efficient execution on everyday devices with effective 4B active size. ([Ollama][7])                         | **Latency-focused option**                    |
+| `command-r`        | Built for RAG, long context, APIs, and tools. ([Ollama][8])                                                               | **Good architecture fit, but probably heavy** |
+| `deepseek-r1:8b`   | Strong reasoning model. ([Ollama][9])                                                                                     | **Not ideal for ERP JSON/tool calling**       |
+
+[1]: https://ollama.com/library/llama3.1%3A8b?utm_source=chatgpt.com "llama3.1:8b"
+[2]: https://ollama.com/library/llama3.2%3A3b?utm_source=chatgpt.com "llama3.2:3b"
+[3]: https://ollama.com/library/mistral-nemo?utm_source=chatgpt.com "mistral-nemo"
+[4]: https://ollama.com/library/phi4-mini?utm_source=chatgpt.com "phi4-mini"
+[5]: https://ollama.com/library/gemma3%3A4b?utm_source=chatgpt.com "gemma3:4b"
+[6]: https://ollama.com/library/gemma3%3A12b?utm_source=chatgpt.com "gemma3:12b"
+[7]: https://ollama.com/library/gemma3n%3Ae4b?utm_source=chatgpt.com "gemma3n:e4b"
+[8]: https://ollama.com/library/command-r?utm_source=chatgpt.com "command-r"
+[9]: https://ollama.com/library/deepseek-r1%3A8b?utm_source=chatgpt.com "deepseek-r1:8b"
+
+
+
+1. qwen3:8b-q4_K_M        # best multilingual ERP balance
+2. hermes3:8b             # best JSON/tool style behavior
+3. mistral-nemo:12b       # good quality, heavier
+4. llama3.1:8b            # safe fallback
+5. gemma3:12b             # worth testing
+6. phi4-mini              # fast but may miss complex ERP logic
+7. llama3.2:3b            # router only
+8. gemma3:4b / gemma3n:e4b # speed-focused, accuracy risk
+
+
+
+llm = ChatOllama(
+    model="llama3.1:8b",
+    temperature=0.0,
+    keep_alive="30m",
+    num_ctx=2048,
+)
+
+
+llm = ChatOllama(
+    model="mistral-nemo:12b",
+    temperature=0.0,
+    keep_alive="30m",
+    num_ctx=2048,
+)
+
+
+llm = ChatOllama(
+    model="mistral-nemo:12b",
+    temperature=0.0,
+    keep_alive="30m",
+    num_ctx=2048,
+)
+
+
+llm = ChatOllama(
+    model="llama3-groq-tool-use:8b",
+    temperature=0.0,
+    keep_alive="30m",
+    num_ctx=2048,
+)
+
+
+llm = ChatOllama(
+    model="granite4.1:8b",
+    temperature=0.0,
+    keep_alive="30m",
+    num_ctx=2048,
+)
+
+
+llm = ChatOllama(
+    model="phi4-mini",
+    temperature=0.0,
+    keep_alive="30m",
+    num_ctx=2048,
+)
