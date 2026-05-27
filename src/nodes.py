@@ -8,6 +8,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, Tool
 from langgraph.prebuilt import ToolNode
 import json
 import re
+from langsmith import traceable
 CANONICALIZER_PROMPT = """
 You convert ERP/accounting queries written in English, Hindi, Hinglish, Gujarati, or mixed language into simple canonical English.
 
@@ -176,7 +177,7 @@ def extract_json_object(text: str) -> dict:
     except Exception:
         return {}
 
-
+@traceable(name="canonicalizer_node", run_type="chain")
 async def canonicalizer_node(state: MainState) -> MainState:
     try:
         print("Canonicalizer node triggered")
@@ -383,6 +384,8 @@ def get_tools_by_category(registry: dict, category: str) -> list[str]:
 # ============================================
 # SEMANTIC SEARCH NODE
 # ============================================
+
+@traceable(name="semantic_search_node", run_type="retriever")
 async def semantic_search(state: MainState) -> MainState:
     try:
         print("Semantic search node triggered")
@@ -560,7 +563,27 @@ ALL/LIST RULES:
 - For multi-part queries, create one tool call for each relevant tool.
 - Do not stop after one tool call.
 
+SAME-TOOL MULTI-INTENT RULE:
 
+If the user asks multiple independent requests that require the same tool with different filters, call the same tool multiple times.
+
+Do not merge different filters into one call.
+Do not drop the second same-tool request.
+
+Example:
+User asks:
+"48211090 HSN negative stock dikha aur HSN 00000000 product check kar"
+
+Correct tool calls:
+1. get_product_list with filters {"hsn": "48211090", "closingQty": {"lt": 0}}
+2. get_product_list with filters {"hsn": "00000000"}
+
+Incorrect:
+Only calling get_product_list for HSN 48211090.
+Every independent query part joined by ";", "aur", "and", "ane", or "also" must be satisfied.
+Each part must result in either:
+- a tool call with matching filters, or
+- an empty result section after tool execution.
 STRICT:
 Always include fields.
 Invoice query: include invoiceNo.
@@ -621,7 +644,7 @@ def print_ollama_metadata(response):
     print("eval_count:", metadata.get("eval_count"))
     print("=====================================\n")
 
-
+@traceable(name="chat_model_node", run_type="llm")
 async def chat_model_node(state: MainState):
     node_start = now()
 
@@ -972,6 +995,7 @@ def apply_final_postprocessing(
 # ============================================
 # DETERMINISTIC FINAL NODE
 # ============================================
+@traceable(name="deterministic_final_node", run_type="chain")
 async def deterministic_final_node(state: MainState):
     """
     Builds final JSON using Python, not LLM.
@@ -1083,6 +1107,7 @@ tools_node = ToolNode(tools)
 
 #A new router node is being added since we will use the new router llm which is a small llm and we will use it to do our basic work that way we can make 
 # a more simpler prompt for our main llm
+@traceable(name="router_node", run_type="chain")
 async def router_node(state: MainState):
     """
     Small model router:

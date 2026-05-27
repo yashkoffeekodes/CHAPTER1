@@ -11,3 +11,5 @@ ipython
 langchain-ollama
 fastapi
 requests
+langsmith
+python-dotenv

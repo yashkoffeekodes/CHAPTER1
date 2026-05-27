@@ -3,7 +3,7 @@ import json
 from typing import Optional, Any
 from src.api_client import api_post
 from src.config import COMPANY_ID
-
+from langsmith import traceable
 
 def normalize_fields(fields):
     if fields is None:
@@ -205,6 +205,7 @@ def make_purchase_sales_body(
 
 
 @tool
+@traceable(name="get_product_list", run_type="tool")
 def get_product_list(
     page: int = 1,
     limit: int = 10,
@@ -235,6 +236,7 @@ def get_product_list(
     return json.dumps(result,ensure_ascii=False)
 
 @tool
+@traceable(name="get_purchase_list", run_type="tool")
 def get_purchase_list(
 page: int = 1,
     limit: int = 10,
@@ -275,6 +277,7 @@ page: int = 1,
     return json.dumps(result,ensure_ascii=False)
 
 @tool
+@traceable(name="get_sales_list", run_type="tool")
 def get_sales_list(
     page: int = 1,
     limit: int = 10,

@@ -1,5 +1,4 @@
-# src/api_client.py
-
+from langsmith import traceable
 import requests
 from typing import Any, Optional
 
@@ -41,7 +40,7 @@ def parse_response(response: requests.Response) -> dict[str, Any]:
         "raw_response": payload,
     }
 
-
+@traceable(name="chapter1_api_post",run_type="tool")
 def api_post(endpoint: str, body: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     url = build_url(endpoint)
     final_body = body or {}

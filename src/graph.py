@@ -118,3 +118,6 @@ def graph_builder():
         raise e
 
     return graph
+
+
+graph = graph_builder()
