@@ -1,4 +1,9 @@
 venv/
 .env
 chroma_db
-__pycache__.langgraph_api/
+__pycache__
+.langgraph_api/
+graph.txt
+models.txt
+nodes.txt
+prompt.txt*.pyc

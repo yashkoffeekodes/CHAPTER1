@@ -1,196 +1,163 @@
 from langchain_core.documents import Document
 
-
-TOOL_DOCUMENTS = [
-
-    Document(
-        page_content="""
-        Tool: get_purchase_list
-
-        Use this tool to fetch purchase records from the ERP purchaseList API.
-
-        Supported arguments:
-        - page
-        - limit
-        - term
-        - ledger_id
-        - from_date
-        - to_date
-
-        Use term for supplier name, purchase invoice number, reference number,
-        keyword search, GST keyword, or general purchase search.
-
-        Use this tool for purchase invoices, supplier bills, vendor bills,
-        purchase amounts, purchase dates, outstanding purchases, purchase GST,
-        and purchase records.
-        """,
-        metadata={
-            "tool_name": "get_purchase_list",
-            "category": "purchase",
-            "data_source": "erp_api.purchaseList",
-        },
-    ),
-
-    Document(
-        page_content="""
-        Tool: get_sales_list
-
-        Use this tool to fetch sales records from the ERP salesList API.
-
-        Supported arguments:
-        - page
-        - limit
-        - term
-        - ledger_id
-        - from_date
-        - to_date
-
-        Use term for customer name, sales invoice number, reference number,
-        keyword search, GST keyword, or general sales search.
-
-        Use this tool for sales invoices, customer bills, sale bills,
-        sales amounts, sales dates, outstanding sales, sales GST,
-        and sales records.
-        """,
-        metadata={
-            "tool_name": "get_sales_list",
-            "category": "sales",
-            "data_source": "erp_api.salesList",
-        },
-    ),
-
-    Document(
-        page_content="""
-        Tool: get_product_list
-
-        Use this tool to fetch products from the ERP productList API.
-
-        Supported arguments:
-        - page
-        - limit
-        - term
-
-        Use term for product name, item name, SKU, HSN, GST keyword,
-        inventory keyword, or general product search.
-
-        Use this tool for products, inventory, item master, stock,
-        SKU, HSN, GST rates, closing quantity, and product details.
-        """,
-        metadata={
-            "tool_name": "get_product_list",
-            "category": "inventory",
-            "data_source": "erp_api.productList",
-        },
-    ),
-]
+# ============================================================
+# SIMPLE 6-TOOL REGISTRY
+# This is routing/tool metadata only. It does NOT contain business data.
+# Business data always comes from the Chapter-1 API.
+# ============================================================
 
 TOOL_INTENT_REGISTRY = {
-    "get_sales_list": {
-        "category": "invoice",
-        "domain": "sales",
-        "description": "Fetch sales invoices, sales bills, customer bills, sold items, customer amount, outstanding, status, GST and sales invoice details.",
+    "get_customer": {
+        "category": "customer",
+        "description": "Search customers or parties and return id, name, opening balance and opening type.",
         "aliases": [
-            "sales invoice",
-            "sale invoice",
-            "sales bill",
-            "sale bill",
-            "customer bill",
-            "customer invoice",
-            "sold",
-            "sell",
-            "selling",
-            "bikri",
-            "customer",
-            "customers",
-            "grahak",
-            "khareedaar",
-            "party sold to",
+            "customer", "customers", "party", "parties", "client", "buyer", "grahak",
         ],
+        "keywords": [
+            "customer id", "party id", "customer name", "party name",
+            "opening balance", "opening type", "find customer", "search customer",
+        ],
+        "fields": ["id", "name", "openingBalance", "openingType"],
         "field_aliases": {
-            "invoiceNo": ["invoice number", "bill number", "bill no", "invoice no"],
-            "billToName": ["customer", "customer name", "party", "grahak", "khareedaar"],
-            "netAmount": ["amount", "net amount", "total", "rakam", "paisa"],
-            "outstanding": ["pending", "baki", "baqaya", "due", "outstanding"],
-            "status": ["status", "stithi", "sthiti", "paid", "unpaid"],
-            "invoiceDate": ["date", "bill date", "invoice date"],
-            "taxableAmount": ["taxable", "taxable amount"],
-            "igstAmount": ["igst"],
-            "cgstAmount": ["cgst"],
-            "sgstAmount": ["sgst"],
+            "id": ["customer id", "party id", "id"],
+            "name": ["name", "customer name", "party name"],
+            "openingBalance": ["opening balance", "opening"],
+            "openingType": ["opening type"],
         },
-        "default_fields": ["invoiceNo", "billToName", "netAmount", "status"],
     },
 
-    "get_purchase_list": {
-        "category": "invoice",
-        "domain": "purchase",
-        "description": "Fetch purchase invoices, purchase bills, vendor bills, supplier bills, purchase amount, outstanding, status, GST and purchase invoice details.",
+    "get_customer_ledger": {
+        "category": "customer_ledger",
+        "description": "Fetch customer ledger or account statement by customer_id; returns opening, current, closing balance and transactions.",
         "aliases": [
-            "purchase invoice",
-            "purchase bill",
-            "vendor bill",
-            "supplier bill",
-            "bought",
-            "buy",
-            "purchase",
-            "purchased",
-            "kharidi",
-            "khareedi",
-            "kharid",
-            "vendor",
-            "vendors",
-            "supplier",
-            "suppliers",
-            "vikreta",
-            "aapurti",
-            "jinse kharidi",
+            "ledger", "account statement", "statement", "khata", "hisab",
+        ],
+        "keywords": [
+            "customer ledger", "ledger balance", "closing balance", "current balance",
+            "opening balance", "transactions", "transaction", "entries", "debit", "credit",
+        ],
+        "fields": [
+            "ledgerName", "glName", "opening", "current", "closing", "period",
+            "total_rows", "total_pages", "transactions",
         ],
         "field_aliases": {
-            "invoiceNo": ["invoice number", "bill number", "bill no", "invoice no"],
-            "billToName": ["vendor", "vendor name", "supplier", "supplier name", "vikreta", "aapurti karta"],
-            "netAmount": ["amount", "net amount", "total", "rakam", "paisa", "kul rakam"],
-            "outstanding": ["pending", "baki", "baqaya", "due", "outstanding"],
-            "status": ["status", "stithi", "sthiti", "paid", "unpaid"],
-            "invoiceDate": ["date", "bill date", "invoice date"],
-            "taxableAmount": ["taxable", "taxable amount"],
-            "igstAmount": ["igst"],
-            "cgstAmount": ["cgst"],
-            "sgstAmount": ["sgst"],
+            "ledgerName": ["ledger name"],
+            "glName": ["gl name"],
+            "opening": ["opening", "opening balance"],
+            "current": ["current", "current balance"],
+            "closing": ["closing", "closing balance"],
+            "period": ["period", "from", "to"],
+            "transactions": ["transaction", "transactions", "statement", "entry", "entries"],
         },
-        "default_fields": ["invoiceNo", "billToName", "netAmount"],
     },
 
-    "get_product_list": {
-        "category": "inventory",
-        "domain": "product",
-        "description": "Fetch products, items, goods, inventory, stock, HSN, GST rate, closing quantity and product details.",
+    "get_stock_levels": {
+        "category": "stock",
+        "description": "Fetch stock and inventory levels using product name, SKU or HSN; returns closing quantity/value, low stock and out-of-stock details.",
         "aliases": [
-            "product",
-            "products",
-            "item",
-            "items",
-            "goods",
-            "maal",
-            "saman",
-            "inventory",
-            "stock",
-            "closing stock",
-            "negative stock",
-            "minus stock",
-            "hsn",
-            "gst rate",
-            "tax rate",
+            "stock", "inventory", "product", "products", "item", "items",
+            "maal", "jaththo", "satha",
+        ],
+        "keywords": [
+            "hsn", "hsn code", "sku", "closing quantity", "closing qty",
+            "closing stock", "closing value", "closing rate", "low stock", "out of stock",
+        ],
+        "fields": [
+            "id", "name", "sku", "hsnCode", "group", "uom", "openingQty", "openingRate",
+            "openingValue", "inwardQty", "inwardValue", "outwardQty", "outwardValue",
+            "closingQty", "closingRate", "closingValue", "isLowStock", "isOutOfStock",
         ],
         "field_aliases": {
-            "name": ["product name", "item name", "goods name", "naam"],
-            "sku": ["sku", "code"],
-            "hsn": ["hsn", "hsn code"],
-            "closingQty": ["stock", "quantity", "qty", "closing quantity", "matra", "bacha hua stock"],
-            "closingRate": ["rate", "closing rate"],
-            "igst": ["igst", "gst"],
+            "name": ["name", "product name", "item name"],
+            "sku": ["sku"],
+            "hsnCode": ["hsn", "hsn code"],
+            "closingQty": ["closing quantity", "closing qty", "quantity", "qty", "closing stock"],
+            "closingValue": ["closing value", "value"],
+            "closingRate": ["closing rate", "rate"],
+            "isLowStock": ["low stock"],
+            "isOutOfStock": ["out of stock"],
+        },
+    },
+
+    "get_gst_summary": {
+        "category": "gst_report",
+        "description": "Fetch GST summary/report by date range; supports B2B, B2C, exports, nil/exempt, credit notes and grand total rows.",
+        "aliases": ["gst", "gstr", "gst summary", "gst report"],
+        "keywords": [
+            "b2b", "b2c", "b2c large", "b2c small", "exports", "export",
+            "nil rated", "exempt", "igst", "cgst", "sgst", "cess",
+            "taxable amount", "invoice amount", "voucher count", "grand total", "total gst",
+        ],
+        "fields": [
+            "category", "name", "voucherCount", "taxableAmount", "igst", "cgst",
+            "sgst", "cess", "tax", "invoiceAmount",
+        ],
+        "field_aliases": {
+            "category": ["category", "b2b", "b2c", "exports", "nil", "grand total"],
+            "name": ["name"],
+            "voucherCount": ["voucher count", "voucher"],
+            "taxableAmount": ["taxable amount", "taxable"],
+            "igst": ["igst"],
             "cgst": ["cgst"],
             "sgst": ["sgst"],
+            "cess": ["cess"],
+            "tax": ["total tax", "tax"],
+            "invoiceAmount": ["invoice amount"],
         },
-        "default_fields": ["name", "sku", "hsn"],
+    },
+
+    "get_tds_outstanding": {
+        "category": "tds_report",
+        "description": "Fetch TDS outstanding/payable report by date range; supports section filters like 194C, 194J and 194I.",
+        "aliases": ["tds", "tds outstanding", "tds payable", "tds report"],
+        "keywords": ["tds", "outstanding", "payable", "pending", "section", "194c", "194j", "194i"],
+        "fields": [
+            "recordType", "name", "section", "amount", "outstanding",
+            "totalAmount", "totalOutstanding", "total_rows", "total_pages", "period",
+        ],
+        "field_aliases": {
+            "section": ["section", "194c", "194j", "194i"],
+            "amount": ["amount", "total amount"],
+            "outstanding": ["outstanding", "pending", "payable", "total outstanding"],
+            "period": ["period", "from", "to"],
+        },
+    },
+
+    "get_tcs_outstanding": {
+        "category": "tcs_report",
+        "description": "Fetch TCS outstanding/payable report by date range; supports section filters like 206C.",
+        "aliases": ["tcs", "tcs outstanding", "tcs payable", "tcs report"],
+        "keywords": ["tcs", "outstanding", "payable", "pending", "section", "206c"],
+        "fields": [
+            "recordType", "name", "section", "amount", "outstanding",
+            "totalAmount", "totalOutstanding", "total_rows", "total_pages", "period",
+        ],
+        "field_aliases": {
+            "section": ["section", "206c"],
+            "amount": ["amount", "total amount"],
+            "outstanding": ["outstanding", "pending", "payable", "total outstanding"],
+            "period": ["period", "from", "to"],
+        },
     },
 }
+
+
+TOOL_DOCUMENTS = []
+
+for tool_name, meta in TOOL_INTENT_REGISTRY.items():
+    TOOL_DOCUMENTS.append(
+        Document(
+            page_content=f"""
+Tool: {tool_name}
+Category: {meta.get('category', '')}
+Description: {meta.get('description', '')}
+Aliases: {', '.join(meta.get('aliases', []))}
+Keywords: {', '.join(meta.get('keywords', []))}
+Fields: {', '.join(meta.get('fields', []))}
+""".strip(),
+            metadata={
+                "tool_name": tool_name,
+                "category": meta.get("category", ""),
+            },
+        )
+    )

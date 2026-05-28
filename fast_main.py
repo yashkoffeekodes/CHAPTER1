@@ -7,6 +7,7 @@ import json
 import re
 import time
 import asyncio
+import copy
 from typing import Any, Dict, List
 
 import uvicorn
@@ -18,13 +19,109 @@ app = FastAPI(
     title="CHAPTER-1-ASSIST",
     version="1.0.0"
 )
-
-GRAPH_TIMEOUT_SECONDS = 300
-
-# Build graph once when server starts
 graph = graph_builder()
+GRAPH_TIMEOUT_SECONDS = 300
+# ==============================
+# FINAL RESPONSE CACHE
+# ==============================
+
+FINAL_RESPONSE_CACHE = {}
+FINAL_RESPONSE_CACHE_TTL_SECONDS = 300  # 5 minutes
 
 
+def normalize_query_for_cache(query: str) -> str:
+    return " ".join((query or "").lower().strip().split())
+
+
+def should_cache_final_response(result: dict) -> bool:
+    """
+    Only cache complete FastAPI-shaped successful responses.
+
+    Expected shape:
+    {
+        "response": {...},
+        "timings": [...],
+        "total_time_sec": 12.34
+    }
+    """
+
+    if not isinstance(result, dict):
+        return False
+
+    response = result.get("response")
+
+    if not isinstance(response, dict):
+        print("[FINAL CACHE SKIP] Missing response wrapper")
+        return False
+
+    success = response.get("success")
+    status = response.get("status")
+    tools_used = response.get("tools_used", [])
+
+    if not tools_used:
+        print("[FINAL CACHE SKIP] No tools used")
+        return False
+
+    if success is True and status == "success":
+        return True
+
+    print("[FINAL CACHE SKIP] Response not safe to cache")
+    return False
+
+
+def get_cached_final_response(query: str):
+    key = normalize_query_for_cache(query)
+
+    cached = FINAL_RESPONSE_CACHE.get(key)
+
+    if not cached:
+        print(f"[FINAL CACHE MISS] {key}")
+        return None
+
+    age = time.time() - cached.get("cached_at", 0)
+
+    if age > FINAL_RESPONSE_CACHE_TTL_SECONDS:
+        print(f"[FINAL CACHE EXPIRED] {key}")
+        FINAL_RESPONSE_CACHE.pop(key, None)
+        return None
+
+    result = cached.get("result")
+
+    if not isinstance(result, dict) or "response" not in result:
+        print(f"[FINAL CACHE INVALID] {key}")
+        FINAL_RESPONSE_CACHE.pop(key, None)
+        return None
+
+    print(f"[FINAL CACHE HIT] {key}")
+
+    result = json.loads(json.dumps(result, ensure_ascii=False))
+
+    result["timings"] = [
+        {
+            "node": "final_response_cache",
+            "duration_sec": 0.001,
+        }
+    ]
+
+    result["total_time_sec"] = 0.001
+
+    return result
+
+
+def set_cached_final_response(query: str, result: dict):
+    if not should_cache_final_response(result):
+        return
+
+    key = normalize_query_for_cache(query)
+
+    FINAL_RESPONSE_CACHE[key] = {
+        "cached_at": time.time(),
+        "result": json.loads(json.dumps(result, ensure_ascii=False)),
+    }
+
+    print(f"[FINAL CACHE SET] {key}")
+
+    
 class ChatRequest(BaseModel):
     query: str = Field(..., min_length=1)
 
@@ -32,7 +129,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response: Dict[str, Any]
     timings: List[Dict[str, Any]]
-    total_time_sec: float
+    total_time_sec: float   
 
 
 def parse_json_safely(text: str):
@@ -116,6 +213,11 @@ async def run_graph_query(
     user_query: str,
     langsmith_config: dict | None = None,
 ):
+    cached_result = get_cached_final_response(user_query)
+
+    if cached_result is not None:
+        return cached_result
+
     start_time = time.perf_counter()
 
     initial_state = {
@@ -292,11 +394,15 @@ async def run_graph_query(
             tools_used=tools_requested,
         )
 
-    return {
+    result = {
         "response": final_response,
         "timings": timings,
         "total_time_sec": total_time,
     }
+
+    set_cached_final_response(user_query, result)
+
+    return result
 
 
 @app.on_event("startup")
@@ -359,5 +465,4 @@ async def chat(request: ChatRequest):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)
-
 

@@ -3,13 +3,58 @@ import json
 from typing import Optional, Any
 from src.api_client import api_post
 from src.config import COMPANY_ID
-from langsmith import traceable
+import time
+import copy
+
+
+CUSTOMER_ENDPOINT = "/customers"
+CUSTOMER_LEDGER_ENDPOINT = "/customers/ledger"
+STOCK_LEVELS_ENDPOINT = "/inventory/stock"
+GST_SUMMARY_ENDPOINT = "/reports/gst-summary"
+TDS_OUTSTANDING_ENDPOINT = "/reports/tds-outstanding"
+TCS_OUTSTANDING_ENDPOINT = "/reports/tcs-outstanding"
+
+api_cache_ttl_secs = 600  # 10 minutes
+api_cache = {}
+
+def make_cache_key(endpoint: str, body: dict) -> str:
+    return f"{endpoint}::{json.dumps(body, sort_keys=True, ensure_ascii=False)}"
+
+
+def cached_api_post(endpoint: str, body: dict) -> dict:
+    """
+    Caches API responses by endpoint + body.
+    Important: returns deep copies because project_result mutates result["data"].
+    """
+
+    cache_key = make_cache_key(endpoint, body)
+    now = time.time()
+
+    cached = api_cache.get(cache_key)
+
+    if cached:
+        cached_at = cached["cached_at"]
+        age = now - cached_at
+
+        if age <= api_cache_ttl_secs:
+            print(f"[CACHE HIT] {endpoint}")
+            return copy.deepcopy(cached["result"])
+
+        print(f"[CACHE EXPIRED] {endpoint}")
+        api_cache.pop(cache_key, None)
+
+    print(f"[CACHE MISS] {endpoint}")
+    result = api_post(endpoint, body=body)
+
+    api_cache[cache_key] = {
+        "cached_at": now,
+        "result": copy.deepcopy(result),
+    }
+
+    return copy.deepcopy(result)
 
 def normalize_fields(fields):
-    if fields is None:
-        return []
-
-    if fields == "":
+    if fields is None or fields == "":
         return []
 
     if isinstance(fields, list):
@@ -139,30 +184,28 @@ def project_fields(records, fields=None):
         if not isinstance(record, dict):
             continue
 
-        projected_records.append({
+        projected = {
             field: record.get(field)
             for field in selected_fields
             if field in record
-        })
+        }
+
+        # Prevent fake records like [{}] from being counted as valid data.
+        if projected:
+            projected_records.append(projected)
 
     return projected_records
 
-def add_filter_fields_to_fields(fields, filters=None):
-    selected_fields = normalize_fields(fields)
 
-    if isinstance(filters, dict):
-        for field in filters.keys():
-            if field not in selected_fields:
-                selected_fields.insert(0, field)
-
-    return selected_fields
 def project_result(result: dict, fields=None, filters=None) -> dict:
     if not isinstance(result, dict):
         return {
             "success": False,
+            "status_code": None,
             "data": [],
             "count": 0,
-            "error": "API result is not a dictionary"
+            "error": "API result is not a dictionary",
+            "raw_response": result,
         }
 
     if not result.get("success", False):
@@ -175,7 +218,7 @@ def project_result(result: dict, fields=None, filters=None) -> dict:
 
     if not isinstance(data, list):
         data = [data]
-    fields = add_filter_fields_to_fields(fields, filters)
+
     data = apply_filters(data, filters)
     data = project_fields(data, fields)
 
@@ -183,141 +226,349 @@ def project_result(result: dict, fields=None, filters=None) -> dict:
     result["count"] = len(data)
 
     return result
-def make_purchase_sales_body(
-    page: int,
-    limit: int,
-    term: str,
-    ledger_id: int,
+
+def flatten_gst_summary_result(result: dict) -> dict:
+    """
+    Converts GST summary object into list rows so deterministic_final can handle it.
+    """
+
+    if not result.get("success"):
+        return result
+
+    raw = result.get("raw_response", {}) or {}
+    gst_data = raw.get("data") or result.get("data") or {}
+
+    rows = []
+
+    if isinstance(gst_data, dict):
+        for category_key, values in gst_data.items():
+            if isinstance(values, dict):
+                rows.append({
+                    "category": category_key,
+                    **values,
+                })
+
+    grand_total = raw.get("grandTotal")
+
+    if isinstance(grand_total, dict):
+        rows.append({
+            "category": "grandTotal",
+            "name": "Grand Total",
+            **grand_total,
+        })
+
+    result["data"] = rows
+    result["count"] = len(rows)
+    result["period"] = raw.get("period")
+
+    return result
+
+
+def append_report_summary_row(result: dict, report_type: str) -> dict:
+    """
+    Adds summary row for TDS/TCS reports so totals are available in final data.
+    """
+
+    if not result.get("success"):
+        return result
+
+    raw = result.get("raw_response", {}) or {}
+    records = result.get("data", [])
+
+    if records is None:
+        records = []
+
+    if not isinstance(records, list):
+        records = [records]
+
+    normalized_records = []
+
+    for record in records:
+        if isinstance(record, dict):
+            normalized_records.append({
+                "recordType": report_type,
+                **record,
+            })
+
+    summary = raw.get("summary")
+
+    if isinstance(summary, dict):
+        normalized_records.append({
+            "recordType": "summary",
+            "name": "Summary",
+            **summary,
+            "total_rows": raw.get("total_rows"),
+            "total_pages": raw.get("total_pages"),
+            "period": raw.get("period"),
+        })
+
+    result["data"] = normalized_records
+    result["count"] = len(normalized_records)
+    result["period"] = raw.get("period")
+
+    return result
+# ============================================================
+# TOOLS
+# ============================================================
+@tool
+def get_gst_summary(
     from_date: str,
-    to_date: str
-) -> dict:
-    return {
+    to_date: str,
+    fields: Optional[Any] = None,
+    filters: Optional[dict[str, Any]] = None,
+):
+    """
+    Fetch GST summary report for a date range.
+    """
+
+    body = {
         "companyId": COMPANY_ID,
-        "page": page,
-        "limit": limit,
-        "term": term or "",
-        "ledgerId": ledger_id,
-        "from": from_date or "",
-        "to": to_date or "",
+        "from": from_date,
+        "to": to_date,
     }
 
+    result = cached_api_post(GST_SUMMARY_ENDPOINT, body=body)
+    result = flatten_gst_summary_result(result)
+    result = project_result(result, fields=fields, filters=filters)
 
+    print("[TOOL OUTPUT]", result)
+    return json.dumps(result, ensure_ascii=False)
 
 
 @tool
-@traceable(name="get_product_list", run_type="tool")
-def get_product_list(
+def get_tds_outstanding(
+    from_date: str = "",
+    to_date: str = "",
+    page: int = 1,
+    limit: int = 10,
+    fields: Optional[Any] = None,
+    filters: Optional[dict[str, Any]] = None,
+):
+    """
+    Fetch TDS outstanding report for a date range.
+    """
+
+    body = {
+        "companyId": COMPANY_ID,
+        "from": from_date or "",
+        "to": to_date or "",
+        "page": page,
+        "limit": limit,
+    }
+
+    result = cached_api_post(TDS_OUTSTANDING_ENDPOINT, body=body)
+    result = append_report_summary_row(result, "tdsOutstanding")
+    result = project_result(result, fields=fields, filters=filters)
+
+    print("[TOOL OUTPUT]", result)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@tool
+def get_tcs_outstanding(
+    from_date: str = "",
+    to_date: str = "",
+    page: int = 1,
+    limit: int = 10,
+    fields: Optional[Any] = None,
+    filters: Optional[dict[str, Any]] = None,
+):
+    """
+    Fetch TCS outstanding report for a date range.
+    """
+
+    body = {
+        "companyId": COMPANY_ID,
+        "from": from_date or "",
+        "to": to_date or "",
+        "page": page,
+        "limit": limit,
+    }
+
+    result = cached_api_post(TCS_OUTSTANDING_ENDPOINT, body=body)
+    result = append_report_summary_row(result, "tcsOutstanding")
+    result = project_result(result, fields=fields, filters=filters)
+
+    print("[TOOL OUTPUT]", result)
+    return json.dumps(result, ensure_ascii=False)
+@tool
+def get_customer(
+    search: Optional[str] = "",
+    limit: int = 10,
+    fields: Optional[Any] = None,
+    filters: Optional[dict[str, Any]] = None,
+):
+    """
+    Search and retrieve customers/parties/ledgers from Chapter-1 API.
+
+    Use this tool when the user asks about customers, customer name,
+    customer ID, ledger party, customer opening balance, or wants to find
+    a customer before fetching customer ledger.
+
+    Args:
+        search: Customer name, party name, ledger name, or search keyword.
+        limit: Number of records to fetch. Default is 10.
+        fields: Optional output columns.
+        filters: Optional exact filters.
+    """
+
+    body = {
+        "companyId": COMPANY_ID,
+        "search": search or "",
+        "limit": limit,
+    }
+
+    result = cached_api_post(CUSTOMER_ENDPOINT, body=body)
+    result = project_result(result, fields=fields, filters=filters)
+
+    print("[TOOL OUTPUT]", result)
+    return json.dumps(result, ensure_ascii=False)
+
+
+@tool
+def get_customer_ledger(
+    customer_id: int,
+    from_date: str = "",
+    to_date: str = "",
+    page: int = 1,
+    limit: int = 10,
+    fields: Optional[Any] = None,
+    filters: Optional[dict[str, Any]] = None,
+):
+    """
+    Get ledger/account statement details for a specific customer.
+
+    Use this tool when the user asks about customer ledger, account statement,
+    ledger entries, transactions, opening balance, current balance,
+    closing balance, debit/credit history, or customer account statement.
+
+    Important:
+        customer_id is required.
+        If the user gives only customer name, call get_customer first.
+
+    Args:
+        customer_id: Numeric customer ID.
+        from_date: Start date in YYYY-MM-DD. Empty string if not provided.
+        to_date: End date in YYYY-MM-DD. Empty string if not provided.
+        page: Page number. Default is 1.
+        limit: Number of ledger rows. Default is 10.
+        fields: Optional output columns.
+        filters: Optional exact filters.
+    """
+
+    body = {
+        "companyId": COMPANY_ID,
+        "customerId": customer_id,
+        "from": from_date or "",
+        "to": to_date or "",
+        "page": page,
+        "limit": limit,
+    }
+
+    result = cached_api_post(CUSTOMER_LEDGER_ENDPOINT, body=body)
+
+    if not isinstance(result, dict) or not result.get("success", False):
+        print("[TOOL OUTPUT]", result)
+        return json.dumps(result, ensure_ascii=False)
+
+    raw = result.get("raw_response", {}) or {}
+
+    ledger_record = {
+        "ledgerName": raw.get("ledgerName"),
+        "glName": raw.get("glName"),
+        "opening": raw.get("opening"),
+        "current": raw.get("current"),
+        "closing": raw.get("closing"),
+        "period": raw.get("period"),
+        "total_rows": raw.get("total_rows"),
+        "total_pages": raw.get("total_pages"),
+        "transactions": raw.get("data", []),
+    }
+
+    records = [ledger_record]
+    records = apply_filters(records, filters)
+    records = project_fields(records, fields)
+
+    final_result = {
+        "success": True,
+        "status_code": result.get("status_code"),
+        "data": records,
+        "count": len(records),
+        "error": None,
+        "raw_response": raw,
+    }
+
+    print("[TOOL OUTPUT]", final_result)
+    return json.dumps(final_result, ensure_ascii=False)
+
+
+@tool
+def get_stock_levels(
+    from_date: Optional[str] = "",
+    to_date: Optional[str] = "",
+    low_stock_only: bool = False,
     page: int = 1,
     limit: int = 10,
     term: Optional[str] = "",
+    sort_field: str = "name",
+    sort_order: str = "asc",
     fields: Optional[Any] = None,
-    filters: Optional[dict[str, Any]] = None  
+    filters: Optional[dict[str, Any]] = None,
 ):
     """
-    Get product/inventory list from Chapter-1 API.
+    Get stock/inventory levels from Chapter-1 API.
 
-    Use this tool when the user asks about products, inventory, items,
-    stock, SKU, HSN, GST rate, product name, or item details.
-
-    Args:
-        page: Page number. Default is 1.
-        limit: Number of records to fetch. Default is 10.
-        term: Search keyword for product name, SKU, HSN, or item keyword.
-    """
-    body = {
-        "companyId": COMPANY_ID,
-        "page": page,
-        "limit": limit,
-        "term": term or ""
-    }
-    result = api_post("/productList",body=body)
-    result = project_result(result, fields=fields, filters=filters)
-    print("[TOOL OUTPUT]", result)
-    return json.dumps(result,ensure_ascii=False)
-
-@tool
-@traceable(name="get_purchase_list", run_type="tool")
-def get_purchase_list(
-page: int = 1,
-    limit: int = 10,
-    term: Optional[str] = "",
-    ledger_id: int = 0,
-    from_date: Optional[str] = "",
-    to_date: Optional[str] = "",
-    fields: Optional[Any] = None,
-    filters: Optional[dict[str, Any]] = None
-    ):
-    """
-        Get purchase invoice/list records from ERP API.
-
-    Use this tool when the user asks about purchases, purchase invoices,
-    vendor bills, supplier bills, purchase amount, purchase date,
-    purchase invoice number, purchase ledger, or purchase records.
+    Use this tool when the user asks about stock levels, inventory,
+    product stock, low stock, out of stock, closing quantity, HSN code,
+    SKU, inward quantity, outward quantity, closing value, or item stock.
 
     Args:
+        from_date: Start date. Empty string if not given.
+        to_date: End date. Empty string if not given.
+        low_stock_only: True when user asks for low stock only.
         page: Page number. Default is 1.
-        limit: Number of records to fetch. Default is 10.
-        term: Search keyword such as invoice number, supplier name, reference number, or keyword.
-        ledger_id: Ledger ID filter. Use 0 when no specific ledger is provided.
-        from_date: Start date filter. Use empty string when not provided.
-        to_date: End date filter. Use empty string when not provided.
+        limit: Number of records. Default is 10.
+        term: Product name, HSN code, SKU, or search keyword.
+        sort_field: Sort field. Default is "name".
+        sort_order: "asc" or "desc". Default is "asc".
+        fields: Optional output columns.
+        filters: Optional exact filters.
     """
+
     body = {
         "companyId": COMPANY_ID,
+        "from": from_date or "",
+        "to": to_date or "",
+        "lowStockOnly": low_stock_only,
         "page": page,
         "limit": limit,
         "term": term or "",
-        "ledgerId": ledger_id,
-        "from": from_date or "",
-        "to": to_date or "",
+        "sortField": sort_field or "name",
+        "sortOrder": sort_order or "asc",
     }
-    result = api_post("/purchaseList",body=body)
+
+    result = cached_api_post(STOCK_LEVELS_ENDPOINT, body=body)
     result = project_result(result, fields=fields, filters=filters)
+    if low_stock_only and result.get("success"):
+        records = result.get("data", [])
+
+        records = [
+            record for record in records
+            if isinstance(record, dict) and record.get("isLowStock") is True
+        ]
+
+        result["data"] = records
+        result["count"] = len(records)
     print("[TOOL OUTPUT]", result)
-    return json.dumps(result,ensure_ascii=False)
+    return json.dumps(result, ensure_ascii=False)
 
-@tool
-@traceable(name="get_sales_list", run_type="tool")
-def get_sales_list(
-    page: int = 1,
-    limit: int = 10,
-    term: Optional[str] = "",
-    ledger_id: int = 0,
-    from_date: Optional[str] = "",
-    to_date: Optional[str] = "",
-    fields: Optional[Any] = None,
-    filters: Optional[dict[str, Any]] = None
-):
-    """
-    Get sales invoice/list records from ERP API.
+tools = [
+    get_customer,
+    get_customer_ledger,
+    get_stock_levels,
+    get_gst_summary,
+    get_tds_outstanding,
+    get_tcs_outstanding,
+]
 
-    Use this tool when the user asks about sales, sales invoices,
-    customer invoices, sale bills, customer bills, sales amount,
-    sales date, sales invoice number, sales ledger, or sales records.
-
-    Args:
-        page: Page number. Default is 1.
-        limit: Number of records to fetch. Default is 10.
-        term: Search keyword such as invoice number, customer name, reference number, or keyword.
-        ledger_id: Ledger ID filter. Use 0 when no specific ledger is provided.
-        from_date: Start date filter. Use empty string when not provided.
-        to_date: End date filter. Use empty string when not provided.
-    """
-
-    body = {
-        "companyId": COMPANY_ID,
-        "page": page,
-        "limit": limit,
-        "term": term or "",
-        "ledgerId": ledger_id,
-        "from": from_date or "",
-        "to": to_date or "",
-    }
-    result = api_post("/salesList",body=body)
-    result = project_result(result, fields=fields, filters=filters)
-    print("[TOOL OUTPUT]", result)
-    return json.dumps(result,ensure_ascii=False)
-
-tools = [get_product_list, get_purchase_list, get_sales_list]
-
-tools_dict = {tool.name : tool for tool in tools}
+tools_dict = {tool.name: tool for tool in tools}

@@ -6,8 +6,7 @@ from src.nodes import (
     tools_node,
     routing_node,
     deterministic_final_node,
-    router_node,
-    canonicalizer_node
+    canonicalizer_node,
 )
 import time
 import inspect
@@ -58,15 +57,6 @@ def timed_node(node_name: str, node_func):
     return wrapper
 
 
-# ADD THIS FUNCTION BEFORE graph_builder()
-def route_after_semantic(state: MainState):
-    if state.get("skip_router", False):
-        print("Skipping router because semantic_search already selected tools")
-        return "chat_model"
-
-    return "router"
-
-
 def graph_builder():
     try:
         print("Building graph...")
@@ -76,11 +66,11 @@ def graph_builder():
             input_schema=InputState,
             output_schema=OutputState,
         )
+
         builder.add_node("canonicalizer", timed_node("canonicalizer", canonicalizer_node))
         builder.add_node("semantic_search", timed_node("semantic_search", semantic_search))
         builder.add_node("chat_model", timed_node("chat_model", chat_model_node))
         builder.add_node("tools", timed_node("tools", tools_node))
-        builder.add_node("router", timed_node("router", router_node))
         builder.add_node(
             "deterministic_final",
             timed_node("deterministic_final", deterministic_final_node),
@@ -88,16 +78,10 @@ def graph_builder():
 
         builder.add_edge(START, "canonicalizer")
         builder.add_edge("canonicalizer", "semantic_search")
-        builder.add_conditional_edges(
-            "semantic_search",
-            route_after_semantic,
-            {
-                "chat_model": "chat_model",
-                "router": "router",
-            },
-        )
 
-        builder.add_edge("router", "chat_model")
+        # Router LLM removed.
+        # semantic_search now directly provides selected_tools to chat_model.
+        builder.add_edge("semantic_search", "chat_model")
 
         builder.add_conditional_edges(
             "chat_model",
@@ -118,6 +102,3 @@ def graph_builder():
         raise e
 
     return graph
-
-
-graph = graph_builder()
