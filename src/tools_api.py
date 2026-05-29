@@ -473,17 +473,12 @@ def get_customer_ledger(
 
     raw = result.get("raw_response", {}) or {}
 
-    ledger_record = {
-        "ledgerName": raw.get("ledgerName"),
-        "glName": raw.get("glName"),
-        "opening": raw.get("opening"),
-        "current": raw.get("current"),
-        "closing": raw.get("closing"),
-        "period": raw.get("period"),
-        "total_rows": raw.get("total_rows"),
-        "total_pages": raw.get("total_pages"),
-        "transactions": raw.get("data", []),
-    }
+    ledger_record = dict(raw)
+    ledger_record.pop("data", None)
+    ledger_record["transactions"] = raw.get("data", [])
+    # Ensure required top-level keys exist even if API changes
+    ledger_record.setdefault("ledgerName", raw.get("ledgerName"))
+    ledger_record.setdefault("period", raw.get("period"))
 
     records = [ledger_record]
     records = apply_filters(records, filters)

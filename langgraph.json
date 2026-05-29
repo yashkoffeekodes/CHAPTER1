@@ -1,7 +1,0 @@
-{
-  "dependencies": ["."],
-  "graphs": {
-    "chapter1_assist": "./src/graph.py:graph"
-  },
-  "env": ".env"
-}

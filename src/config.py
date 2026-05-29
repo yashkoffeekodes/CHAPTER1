@@ -1,8 +1,9 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 from langchain_ollama import ChatOllama,OllamaEmbeddings
 from langchain_groq import ChatGroq
 import os
-from dotenv import load_dotenv
-load_dotenv()
 # embedding_model = OllamaEmbeddings(model = "nomic-embed-text")
 
 token = os.environ.get("GROQ_API_KEY")
@@ -18,20 +19,25 @@ normalizer_llm = ChatOllama(
 
 
 
-# llm = ChatGroq(
-#     model="llama-3.3-70b-versatile",
-#     temperature=0.0,
-#     api_key=token,
-# )
-
-llm = ChatOllama(
-    model="granite4.1:8b",
+llm = ChatGroq(
+    model="llama-3.3-70b-versatile",
     temperature=0.0,
-    keep_alive="30m",
-    num_ctx=2048,
+    api_key=token,
 )
 
-# router_llm = ChatOllama(model="phi4-mini",temperature=0.0)
+# llm = ChatOllama(
+#     model="Phi4-mini:latest",
+#     temperature=0.0,
+#     keep_alive="30m",
+#     num_ctx=2048,
+# )
+
+# router_llm = ChatOllama(
+#     model="qwen3:14b-q4_K_M ",
+#     temperature=0.0,
+#     keep_alive="30m",
+#     num_ctx=2048,
+# )
 
 print("LLM and embedding model initialised!")
 

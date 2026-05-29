@@ -94,12 +94,12 @@ The current stable flow is:
 
 ```text
 START
-  -> canonicalizer_node
-  -> semantic_search
-  -> chat_model_node
-  -> routing_node
-  -> ToolNode
-  -> deterministic_final_node
+  -> translator_node       (granite4.1:8b — Hinglish→English)
+  -> semantic_search       (keyword + metadata tool routing)
+  -> chat_model_node       (Groq llama-3.3-70b — generates tool calls as JSON text)
+  -> routing_node          (conditional: tool_calls? → tools : → end)
+  -> ToolNode              (executes backend APIs)
+  -> deterministic_final   (builds JSON from API data)
   -> END
 ```
 
@@ -107,12 +107,12 @@ START
 
 | Node | Responsibility |
 |---|---|
-| `canonicalizer_node` | Normalizes user query only when required |
-| `semantic_search` | Selects the relevant ERP tools using deterministic keyword and metadata rules |
-| `chat_model_node` | Uses the selected tools and produces tool calls |
-| `routing_node` | Routes execution to tools if tool calls exist |
-| `ToolNode` | Executes selected backend API tools |
-| `deterministic_final_node` | Builds final JSON from tool output without hallucinating |
+| `translator_node` | Translates Hinglish/Hindi queries to English (granite4.1:8b) |
+| `semantic_search` | Selects relevant ERP tools using keyword + metadata rules |
+| `chat_model_node` | Generates tool calls from query + tools (Groq llama-3.3-70b) |
+| `routing_node` | Routes to tools if tool calls exist, else ends |
+| `ToolNode` | Executes backend API tools |
+| `deterministic_final_node` | Builds final JSON from tool output — no hallucination |
 
 ---
 
@@ -181,6 +181,60 @@ Examples:
 | B2B + grand total | `b2b`, `grandTotal` |
 | Full GST summary | All GST categories |
 
+### 5. Deterministic Repair Layer
+
+Groq/llama-3.3-70b generates tool calls as JSON text. A repair layer inside `chat_model_node` (`_apply_repair`) normalizes and corrects tool arguments using metadata from `TOOL_INTENT_REGISTRY[]["repair"]` — no `if/elif` chains:
+
+**Tool name aliases**: `tds_report`→`get_tds_outstanding`, `tcs_report`→`get_tcs_outstanding`, `stock_report`→`get_stock_levels`
+
+**Date alias normalization** (`_repair_tool_call`): Worker outputs `startDate`/`endDate` — these are normalized to canonical `from_date`/`to_date` before repair runs. Also handles `date_from`/`date_to`, `start_date`/`end_date`.
+
+**Worker date preservation** (`_apply_repair`): Worker (Groq) produces correct date ranges. The repair layer captures `from_date`/`to_date` from worker output BEFORE applying overwrite args, then restores them. `date_keywords` only fires when both dates are still missing after all repair steps.
+
+**Segment-based date assignment**: The old "first/last date range" approach broke when query order changed. `extract_date_range_for_tool()` splits the query into per-tool segments bounded by the next major tool keyword, then extracts the first date range from each segment.
+
+**GST repair** (`overwrite=True`): Hard overwrites with `base_args` (empty dates), fills dates via `date_keywords` (only if worker omitted them), removes filters, applies `category_map`, appends keyword-matched fields.
+
+**Stock strict override**: When an 8-digit HSN is found, worker's bad filters are discarded entirely. Args replaced with `{term: HSN, filters: {hsnCode: HSN}, fields: [name, id, hsnCode, closingQty]}`.
+
+**Customer arg override** (`overwrite=True`): Brand (`Nykaa`), city, and requested fields extracted deterministically from query. Multi-city queries create one call per city via `expand_customer_city_calls()`. Unknown location after "Nykaa" (e.g., "Mars") is used as filter.
+
+**Customer ledger arg override** (`overwrite=False`): Forces `customer_id` from regex, segment-based date extraction, fixed fields. `strict_field_keywords` ("sirf"/"only") restricts to `["closing"]`.
+
+**TDS/TCS arg override** (`overwrite=True`): Hard overwrites with `base_args` + `date_keywords` (only if worker omitted dates).
+
+**TCS injection**: If query mentions "tcs" and the tool was selected but missing, injects the call.
+
+**Deduplication**: Two passes — `(name, args)` JSON-key dedup, then safety dedup (keeps first call per tool name for non-customer tools).
+
+**Tolerant JSON parser**: The parser (`parse_planner_json_blocks` + `normalize_planner_blocks`) handles multi-block output, markdown fences, missing `args`/`arguments` keys, and malformed `=` suffixes.
+
+**unsupported_parts**: Invoice/voucher parts are checked per-part. Supported parts proceed; unsupported parts tracked in `state["unsupported_parts"]` (must be in `MainState` TypedDict or langgraph drops it silently) and reported in final response with `status: "partial_success"`.
+
+### 6. Groq JSON Text Planner
+
+The worker LLM (Groq llama-3.3-70b) outputs tool calls as a JSON text array. The system prompt includes concrete examples for each tool:
+
+**Customer lookup**: brand+city → `search="Nykaa"`, `filters={"name":{"contains":"BANGALORE"}}`
+**Ledger**: `customer_id` must be int, dates in YYYY-MM-DD
+**Stock**: HSN → `term="48211090"`, low/out stock via filters
+**GST**: Category mapping (b2b, b2cLarge, etc.), date range
+**TDS/TCS**: Section filter (194C, 206C)
+
+Response text is parsed as JSON, converted to LangChain `tool_calls`, and executed via ToolNode. This approach gives ~0.7s LLM latency.
+
+### 7. Token Usage Logging
+
+Every LLM invocation logs token counts to the console:
+```
+[TOKENS] translator   | model=granite4.1:8b | input=245 | output=48 | total=293
+[TOKENS] chat_model   | provider=groq | model=llama-3.3-70b-versatile | input=375 | output=175 | total=550
+```
+
+Supports both Groq format (`response_metadata.token_usage`) and Ollama format (`prompt_eval_count`/`eval_count`).
+
+No separate router LLM — tool selection is handled directly by the worker.
+
 ### 5. Unsupported Query Guard
 
 Queries for tools not enabled in this version should not trigger random API calls.
@@ -195,8 +249,10 @@ For example, a sales invoice query should not call `get_customer` just because i
 - FastAPI
 - LangGraph
 - LangChain
-- Ollama
-- Local LLM: `granite4.1:8b`
+- Ollama (translator + embeddings)
+- Groq (worker via `llama-3.3-70b-versatile`)
+- Worker LLM: `llama-3.3-70b-versatile` (via Groq API — JSON text tool-calling)
+- Translator LLM: `granite4.1:8b` (via Ollama — Hinglish→English)
 - Embedding model: `bge-m3`
 - Backend ERP API
 
@@ -237,7 +293,9 @@ Create a `.env` file or export environment variables before running the project.
 CHP1_API_BASE_URL=https://dev.chapter1.finance/aiAnalytics/
 COMPANY_ID=355
 CHP1_API_TOKEN=your_api_token_here
-LLM_MODEL=granite4.1:8b
+GROQ_API_KEY=your_groq_api_key_here
+WORKER_LLM=llama-3.3-70b-versatile
+TRANSLATOR_LLM=granite4.1:8b
 EMBED_MODEL=bge-m3
 ```
 
@@ -279,6 +337,8 @@ If needed, pull models:
 ollama pull granite4.1:8b
 ollama pull bge-m3
 ```
+
+You also need a [Groq API key](https://console.groq.com) set as `GROQ_API_KEY` in `.env`.
 
 ---
 
@@ -559,6 +619,7 @@ Planned improvements:
 - Add proper `.env` support for all secrets
 - Add request/response logging controls
 - Add optional fully deterministic data node for known ERP intents
+- Add invoice-level tools (get_sales_invoice, get_purchase_invoice) and handle doc_type splitting
 
 ---
 

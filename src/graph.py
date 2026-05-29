@@ -6,7 +6,7 @@ from src.nodes import (
     tools_node,
     routing_node,
     deterministic_final_node,
-    canonicalizer_node,
+    translator_node,
 )
 import time
 import inspect
@@ -67,7 +67,7 @@ def graph_builder():
             output_schema=OutputState,
         )
 
-        builder.add_node("canonicalizer", timed_node("canonicalizer", canonicalizer_node))
+        builder.add_node("translator", timed_node("translator", translator_node))
         builder.add_node("semantic_search", timed_node("semantic_search", semantic_search))
         builder.add_node("chat_model", timed_node("chat_model", chat_model_node))
         builder.add_node("tools", timed_node("tools", tools_node))
@@ -76,8 +76,8 @@ def graph_builder():
             timed_node("deterministic_final", deterministic_final_node),
         )
 
-        builder.add_edge(START, "canonicalizer")
-        builder.add_edge("canonicalizer", "semantic_search")
+        builder.add_edge(START, "translator")
+        builder.add_edge("translator", "semantic_search")
 
         # Router LLM removed.
         # semantic_search now directly provides selected_tools to chat_model.

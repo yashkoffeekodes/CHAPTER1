@@ -1,15 +1,42 @@
+import re
 from langchain_core.documents import Document
 
 # ============================================================
 # SIMPLE 6-TOOL REGISTRY
 # This is routing/tool metadata only. It does NOT contain business data.
 # Business data always comes from the Chapter-1 API.
+#
+# Each tool now includes:
+#   repair: metadata annotation for generic arg repair (no if/elif needed)
+#   prompt_tips: short instruction injected into the system prompt by build_system_prompt()
 # ============================================================
+
+CITY_WORDS = [
+    "BANGALORE", "KOLKATA", "MUMBAI", "DELHI", "SURAT",
+    "AHMEDABAD", "PUNE", "CHENNAI", "HYDERABAD",
+    "BHIWANDI", "TAURU", "GUWAHATI", "PUNJAB",
+]
+
+
+def _build_field_triggers(field_aliases: dict) -> dict:
+    """Invert field_aliases into keyword->[fields] mapping for field projection."""
+    triggers: dict[str, list[str]] = {}
+    for field, aliases in field_aliases.items():
+        for alias in aliases:
+            alias_l = alias.lower().strip()
+            if alias_l:
+                if alias_l not in triggers:
+                    triggers[alias_l] = []
+                if field not in triggers[alias_l]:
+                    triggers[alias_l].append(field)
+    return triggers
+
 
 TOOL_INTENT_REGISTRY = {
     "get_customer": {
         "category": "customer",
         "description": "Search customers or parties and return id, name, opening balance and opening type.",
+        "prompt_tips": "Brand+city (e.g. Nykaa Bangalore): search=brand, filters=name.contains city.",
         "aliases": [
             "customer", "customers", "party", "parties", "client", "buyer", "grahak",
         ],
@@ -18,17 +45,26 @@ TOOL_INTENT_REGISTRY = {
             "opening balance", "opening type", "find customer", "search customer",
         ],
         "fields": ["id", "name", "openingBalance", "openingType"],
+        "default_fields": ["id", "name"],
         "field_aliases": {
             "id": ["customer id", "party id", "id"],
             "name": ["name", "customer name", "party name"],
             "openingBalance": ["opening balance", "opening"],
-            "openingType": ["opening type"],
+            "openingType": ["opening type", "opening"],
+        },
+        "repair": {
+            "overwrite": True,
+            "base_args": {"search": "", "fields": ["id", "name"]},
+            "keyword_args": {"nykaa": {"search": "Nykaa"}},
+            "city_filter": {"key": "name"},
+            "field_triggers": {"opening balance": "openingBalance", "opening": "openingBalance"},
         },
     },
 
     "get_customer_ledger": {
         "category": "customer_ledger",
         "description": "Fetch customer ledger or account statement by customer_id; returns opening, current, closing balance and transactions.",
+        "prompt_tips": "customer_id=int, dates YYYY-MM-DD, fields=ledgerName,opening,current,closing,period[,transactions].",
         "aliases": [
             "ledger", "account statement", "statement", "khata", "hisab",
         ],
@@ -40,6 +76,7 @@ TOOL_INTENT_REGISTRY = {
             "ledgerName", "glName", "opening", "current", "closing", "period",
             "total_rows", "total_pages", "transactions",
         ],
+        "default_fields": ["ledgerName", "opening", "current", "closing", "period"],
         "field_aliases": {
             "ledgerName": ["ledger name"],
             "glName": ["gl name"],
@@ -49,11 +86,20 @@ TOOL_INTENT_REGISTRY = {
             "period": ["period", "from", "to"],
             "transactions": ["transaction", "transactions", "statement", "entry", "entries"],
         },
+        "repair": {
+            "overwrite": False,
+            "extract_customer_id": True,
+            "date_keywords": ["customer", "ledger", "closing", "opening", "balance"],
+            "strict_field_keywords": {"sirf": ["closing"], "only": ["closing"]},
+            "field_triggers": {"transactions": "transactions", "transaction": "transactions"},
+            "fixed_fields": ["ledgerName", "opening", "current", "closing", "period"],
+        },
     },
 
     "get_stock_levels": {
         "category": "stock",
         "description": "Fetch stock and inventory levels using product name, SKU or HSN; returns closing quantity/value, low stock and out-of-stock details.",
+        "prompt_tips": "HSN: term=HSN, filters=hsnCode. Low stock: low_stock_only=true. Qty compare: closingQty lt/gt.",
         "aliases": [
             "stock", "inventory", "product", "products", "item", "items",
             "maal", "jaththo", "satha",
@@ -67,21 +113,31 @@ TOOL_INTENT_REGISTRY = {
             "openingValue", "inwardQty", "inwardValue", "outwardQty", "outwardValue",
             "closingQty", "closingRate", "closingValue", "isLowStock", "isOutOfStock",
         ],
+        "default_fields": ["name"],
         "field_aliases": {
             "name": ["name", "product name", "item name"],
+            "id": ["id", "product id", "item id"],
             "sku": ["sku"],
             "hsnCode": ["hsn", "hsn code"],
-            "closingQty": ["closing quantity", "closing qty", "quantity", "qty", "closing stock"],
+            "closingQty": ["closing quantity", "closing qty", "quantity", "qty", "closing stock", "closing", "stock", "jaththo", "satha"],
             "closingValue": ["closing value", "value"],
             "closingRate": ["closing rate", "rate"],
             "isLowStock": ["low stock"],
             "isOutOfStock": ["out of stock"],
+        },
+        "repair": {
+            "overwrite": False,
+            "hsn_extract": True,
+            "default_fields": ["name", "id", "hsnCode", "closingQty"],
+            "ensure_fields": ["name", "hsnCode", "closingQty"],
+            "field_triggers": {"value": "closingValue"},
         },
     },
 
     "get_gst_summary": {
         "category": "gst_report",
         "description": "Fetch GST summary/report by date range; supports B2B, B2C, exports, nil/exempt, credit notes and grand total rows.",
+        "prompt_tips": "Categories: B2B=b2b, B2C Large=b2cLarge, B2C Small=b2cSmall, exports=exports, nil=nillRated, grandTotal=grandTotal. Single cat=>filter, multi=>no filter.",
         "aliases": ["gst", "gstr", "gst summary", "gst report"],
         "keywords": [
             "b2b", "b2c", "b2c large", "b2c small", "exports", "export",
@@ -92,6 +148,8 @@ TOOL_INTENT_REGISTRY = {
             "category", "name", "voucherCount", "taxableAmount", "igst", "cgst",
             "sgst", "cess", "tax", "invoiceAmount",
         ],
+        "default_fields": ["category", "name"],
+        "include_all_on_no_trigger": True,
         "field_aliases": {
             "category": ["category", "b2b", "b2c", "exports", "nil", "grand total"],
             "name": ["name"],
@@ -104,42 +162,153 @@ TOOL_INTENT_REGISTRY = {
             "tax": ["total tax", "tax"],
             "invoiceAmount": ["invoice amount"],
         },
+        "repair": {
+            "overwrite": True,
+            "base_args": {
+                "from_date": "",
+                "to_date": "",
+                "fields": ["category", "name"],
+            },
+            "date_keywords": ["gst", "b2b", "grand total", "b2c", "exports", "nil", "exempt", "igst", "cgst", "sgst", "cess", "taxable", "invoice"],
+            "remove_filters": True,
+            "category_map": {
+                "b2b": "b2b",
+                "grand total": "grandTotal",
+                "b2c small": "b2cSmall",
+                "b2c large": "b2cLarge",
+                "b2c": "b2cLarge",
+                "exports": "exports",
+                "nil rated": "nillRated",
+                "nil": "nillRated",
+                "exempt": "nillRated",
+            },
+            "field_triggers": {
+                "taxable amount": "taxableAmount",
+                "invoice amount": "invoiceAmount",
+                "igst": "igst",
+                "cgst": "cgst",
+                "sgst": "sgst",
+                "cess": "cess",
+            },
+        },
     },
 
     "get_tds_outstanding": {
         "category": "tds_report",
         "description": "Fetch TDS outstanding/payable report by date range; supports section filters like 194C, 194J and 194I.",
+        "prompt_tips": "Section filter (e.g. 194C): filters.section=194C. Dates YYYY-MM-DD.",
         "aliases": ["tds", "tds outstanding", "tds payable", "tds report"],
         "keywords": ["tds", "outstanding", "payable", "pending", "section", "194c", "194j", "194i"],
         "fields": [
             "recordType", "name", "section", "amount", "outstanding",
             "totalAmount", "totalOutstanding", "total_rows", "total_pages", "period",
         ],
+        "default_fields": ["recordType", "name"],
+        "always_include_fields": ["period"],
         "field_aliases": {
+            "recordType": ["record type"],
             "section": ["section", "194c", "194j", "194i"],
             "amount": ["amount", "total amount"],
+            "totalAmount": ["total amount", "amount", "total", "summary"],
             "outstanding": ["outstanding", "pending", "payable", "total outstanding"],
+            "totalOutstanding": ["total outstanding", "outstanding", "pending", "payable", "total", "summary"],
+            "total_rows": ["total rows", "total", "summary"],
+            "total_pages": ["total pages", "total", "summary"],
             "period": ["period", "from", "to"],
+        },
+        "repair": {
+            "overwrite": True,
+            "date_keywords": ["tds"],
+            "base_args": {
+                "from_date": "",
+                "to_date": "",
+                "fields": ["recordType", "name", "totalAmount", "totalOutstanding", "period"],
+            },
         },
     },
 
     "get_tcs_outstanding": {
         "category": "tcs_report",
         "description": "Fetch TCS outstanding/payable report by date range; supports section filters like 206C.",
+        "prompt_tips": "Section filter (e.g. 206C): filters.section=206C. Dates YYYY-MM-DD.",
         "aliases": ["tcs", "tcs outstanding", "tcs payable", "tcs report"],
         "keywords": ["tcs", "outstanding", "payable", "pending", "section", "206c"],
         "fields": [
             "recordType", "name", "section", "amount", "outstanding",
             "totalAmount", "totalOutstanding", "total_rows", "total_pages", "period",
         ],
+        "default_fields": ["recordType", "name"],
+        "always_include_fields": ["period"],
         "field_aliases": {
+            "recordType": ["record type"],
             "section": ["section", "206c"],
             "amount": ["amount", "total amount"],
+            "totalAmount": ["total amount", "amount", "total", "summary"],
             "outstanding": ["outstanding", "pending", "payable", "total outstanding"],
+            "totalOutstanding": ["total outstanding", "outstanding", "pending", "payable", "total", "summary"],
+            "total_rows": ["total rows", "total", "summary"],
+            "total_pages": ["total pages", "total", "summary"],
             "period": ["period", "from", "to"],
+        },
+        "repair": {
+            "overwrite": True,
+            "date_keywords": ["tcs"],
+            "base_args": {
+                "from_date": "",
+                "to_date": "",
+                "fields": ["recordType", "name", "totalAmount", "totalOutstanding", "period"],
+            },
         },
     },
 }
+
+
+def get_field_triggers(tool_name: str) -> dict[str, list[str]]:
+    """Build keyword->[fields] mapping from field_aliases for a tool."""
+    meta = TOOL_INTENT_REGISTRY.get(tool_name, {})
+    return _build_field_triggers(meta.get("field_aliases", {}))
+
+
+def _query_matches(q: str, keyword: str) -> bool:
+    """Match keyword in query using word boundaries for single words."""
+    if " " in keyword:
+        return keyword in q
+    return bool(re.search(rf"\b{re.escape(keyword)}\b", q))
+
+
+def infer_requested_fields_from_registry(user_query: str, tool_name: str) -> list[str]:
+    """
+    Generic field inference using TOOL_INTENT_REGISTRY.
+    Replaces the old if/elif chain in infer_requested_fields().
+    """
+    meta = TOOL_INTENT_REGISTRY.get(tool_name)
+    if not meta:
+        return []
+
+    q = (user_query or "").lower()
+    fields = list(meta.get("default_fields", []))
+    triggers = _build_field_triggers(meta.get("field_aliases", {}))
+    any_trigger_matched = False
+
+    for keyword, triggered_fields in triggers.items():
+        if _query_matches(q, keyword):
+            for f in triggered_fields:
+                if f not in fields:
+                    fields.append(f)
+            any_trigger_matched = True
+
+    # GST special: if no specific field asked, include all non-default fields
+    if not any_trigger_matched and meta.get("include_all_on_no_trigger"):
+        for f in meta.get("fields", []):
+            if f not in fields:
+                fields.append(f)
+
+    # TDS/TCS special: always include certain fields
+    for f in meta.get("always_include_fields", []):
+        if f not in fields:
+            fields.append(f)
+
+    return list(dict.fromkeys(fields))
 
 
 TOOL_DOCUMENTS = []

@@ -1,7 +1,7 @@
 from src.schema import MainState
 from src.retriever import retriever
 from src.tools_api import tools_dict, tools
-from src.tool_doc import TOOL_INTENT_REGISTRY
+from src.tool_doc import TOOL_INTENT_REGISTRY, get_field_triggers, infer_requested_fields_from_registry, CITY_WORDS
 from src.config import llm, normalizer_llm
 import time
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
@@ -13,144 +13,44 @@ from langsmith import traceable
 
 def now():
     return time.perf_counter()
-CANONICALIZER_PROMPT = """
-You convert ERP/accounting queries written in English, Hindi, Hinglish, Gujarati, or mixed language into simple canonical English.
 
-Return ONLY raw JSON. No markdown. No explanation.
+# TRANSLATOR_PROMPT = """
+# Rewrite the user query into clear English for an ERP/accounting system.
+# Keep all names, IDs, HSN codes, dates, amounts, sections and invoice/voucher numbers exactly.
+# Preserve every requested task. Do not answer, explain, add facts, remove details, or call tools.
+# If already clear English, return unchanged.
+# Output only the rewritten query.
+# """.strip()
+
+TRANSLATOR_PROMPT = """
+Convert ERP/accounting Hinglish/Hindi/Gujarati queries to canonical English JSON.
+Return ONLY: {"canonical_query":"...","document_type":"...","language":"...","confidence":"high|medium|low"}
+
+Hinglish→English hints:
+bill/invoice=invoice, sale/bikri=sales, purchase/kharidi=purchase
+customer/grahak/party=customer, vendor/supplier/vikreta=vendor
+amount/rakam/paisa=net amount, baki/pending/due=outstanding amount
+stock/qty=closing quantity, kam/zyada=less than/greater than
+dikhao/batao/batavo=show, aur/ane=and
 
 Rules:
-- Do not answer the query.
-- Do not invent data.
-- Preserve invoice numbers exactly.
-- Preserve HSN numbers exactly.
-- Preserve dates exactly.
-- Preserve amounts exactly.
-- Preserve company/customer/vendor names exactly.
-- Convert the business meaning into simple English.
-- Keep the user's intent unchanged.
-
-MULTI-INTENT RULES:
-- If the user asks multiple things joined by aur/and/ane/also, preserve all intents.
-- Do not drop any part of the query.
-- If the query contains both invoice/bill and product/HSN/stock, set document_type to "mixed".
-- If the query contains sales + purchase, set document_type to "mixed".
-- If the query only says bill/invoice and does not clearly say sales or purchase, set document_type to "unknown_invoice".
-
-ERP mappings:
-sales bill / sale bill / bikri bill = sales invoice
-purchase bill / kharidi bill = purchase invoice
-customer / grahak / party = customer
-vendor / supplier = vendor
-amount / rakam / paisa / total = net amount
-baki / pending / due = outstanding amount
-status / paid / unpaid / pending = status
-stock / quantity / qty = closing quantity
-kam / less / niche / ochhi / ochhu = less than
-zyada / vadhu / upar = greater than
-dikhao / batao / batavo / dakhvo / dakhva = show
-
-Output format:
-{
-  "canonical_query": "...",
-  "language": "english|hindi|hinglish|gujarati|mixed",
-  "confidence": "high|medium|low"
-}
+- Preserve IDs, HSN, dates, amounts, names exactly.
+- Keep all intents in multi-part queries.
+- document_type: sales_invoice / purchase_invoice / unknown_invoice / product / mixed.
+- bill/invoice alone (no sales/purchase) -> unknown_invoice.
 
 Examples:
+Q: A/0326/C0077 sales bill ka customer name, amount aur status batao
+A: {"canonical_query": "Show customer name, net amount and status for sales invoice A/0326/C0077", "document_type": "sales_invoice", "language": "hinglish", "confidence": "high"}
 
-User:
-A/0326/C0077 sales bill ka customer name, amount aur status batao
-
-Output:
-{
-  "canonical_query": "Show customer name, net amount and status for sales invoice A/0326/C0077",
-  "document_type": "sales_invoice",
-  "language": "hinglish",
-  "confidence": "high"
-}
-
-User:
-PR-31 purchase bill ka vendor name aur net amount dikhao
-
-Output:
-{
-  "canonical_query": "Show vendor name and net amount for purchase invoice PR-31",
-  "document_type": "purchase_invoice",
-  "language": "hinglish",
-  "confidence": "high"
-}
-
-User:
-A/0326/C0077 wale bill me kitna baqaya paisa reh gaya hai aur bill ki stithi kya hai?
-
-Output:
-{
-  "canonical_query": "Show outstanding amount and status for invoice A/0326/C0077",
-  "document_type": "unknown_invoice",
-  "language": "hinglish",
-  "confidence": "medium"
-}
-
-User:
-HSN 48211090 ke saman me jiska bacha hua stock shunya se kam hai, uska naam aur matra batao
-
-Output:
-{
-  "canonical_query": "Show product name, HSN and closing quantity for products with HSN 48211090 where closing quantity is less than 0",
-  "document_type": "product",
-  "language": "hindi",
-  "confidence": "high"
-}
-
-User:
-A/0326/C0077 bill ka customer amount bata aur HSN 00000000 ka product dikha
-
-Output:
-{
-  "canonical_query": "Show customer name and net amount for invoice A/0326/C0077 and show product details for HSN 00000000",
-  "document_type": "mixed",
-  "language": "hinglish",
-  "confidence": "high"
-}
-
-User:
-A/0326/C0077 kiska bill hai?
-
-Output:
-{
-  "canonical_query": "Show party name for invoice A/0326/C0077",
-  "document_type": "unknown_invoice",
-  "language": "hinglish",
-  "confidence": "medium"
-}
-
-User:
-jo jo customers ko hamne sell kia hai unsabke name chaia
-
-Output:
-{
-  "canonical_query": "Show names of all customers to whom we have sold items",
-  "document_type": "sales_invoice",
-  "language": "hinglish",
-  "confidence": "high"
-}
-
-User:
-hamare sare goods ka list chaia
-
-Output:
-{
-  "canonical_query": "Show list of all products or goods",
-  "document_type": "product",
-  "language": "hinglish",
-  "confidence": "high"
-}
+Q: HSN 48211090 ke saman me jiska bacha hua stock shunya se kam hai, uska naam aur matra batao
+A: {"canonical_query": "Show product name, HSN and closing quantity for products with HSN 48211090 where closing quantity is less than 0", "document_type": "product", "language": "hindi", "confidence": "high"}
 """
 def is_plain_english_query(query: str) -> bool:
     """
     Returns True when the query looks like normal English.
     Mixed Hindi/Gujarati/Marathi slang should return False
-    so canonicalizer can normalize it.
+    so translator can normalize it.
     """
 
     q = query.lower().strip()
@@ -211,7 +111,7 @@ def is_plain_english_query(query: str) -> bool:
 
     return not any(word in words for word in non_english_hints)
 
-def needs_canonicalization(query: str) -> bool:
+def needs_translation(query: str) -> bool:
     q = query.lower()
 
     multilingual_words = {
@@ -229,7 +129,7 @@ def needs_canonicalization(query: str) -> bool:
     return bool(words & multilingual_words)
 
 
-def is_routeable_without_canonicalizer(query: str) -> bool:
+def is_routeable_without_translator(query: str) -> bool:
     """
     Returns True when the query already contains enough ERP/tool-domain
     keywords for semantic_search to route it without normalizer_llm.
@@ -284,21 +184,21 @@ def extract_json_object(text: str) -> dict:
     except Exception:
         return {}
 
-@traceable(name="canonicalizer_node", run_type="chain")
-async def canonicalizer_node(state: MainState) -> MainState:
+@traceable(name="translator_node", run_type="chain")
+async def translator_node(state: MainState) -> MainState:
     """
-    Canonicalizes only when needed.
+    Translates only when needed.
 
     Fast path:
-    - Plain English queries skip canonicalizer.
-    - ERP queries that are already routeable by keyword/domain skip canonicalizer,
+    - Plain English queries skip translator.
+    - ERP queries that are already routeable by keyword/domain skip translator,
       even if they contain Hinglish words like batao/aur/ka.
 
     Slow path:
     - Ambiguous multilingual queries use normalizer_llm.
     """
     try:
-        print("Canonicalizer node triggered")
+        print("Translator node triggered")
 
         user_query = state.get("user_query", "") or ""
 
@@ -307,52 +207,53 @@ async def canonicalizer_node(state: MainState) -> MainState:
                 "original_query": "",
                 "canonical_query": "",
                 "user_query": "",
-                "canonicalizer_used": False,
-                "canonicalizer_confidence": "low",
+                "translator_used": False,
+                "translator_confidence": "low",
                 "detected_language": "unknown",
                 "document_type": "unknown",
             }
 
         if is_plain_english_query(user_query):
-            print("Canonicalizer skipped: query looks English")
+            print("Translator skipped: query looks English")
             return {
                 "original_query": user_query,
                 "canonical_query": user_query,
                 "user_query": user_query,
-                "canonicalizer_used": False,
-                "canonicalizer_confidence": "skipped_english",
+                "translator_used": False,
+                "translator_confidence": "skipped_english",
                 "detected_language": "english",
                 "document_type": "routeable",
             }
 
-        if is_routeable_without_canonicalizer(user_query):
-            print("Canonicalizer skipped: query is directly routeable by ERP keywords")
+        if is_routeable_without_translator(user_query):
+            print("Translator skipped: query is directly routeable by ERP keywords")
             return {
                 "original_query": user_query,
                 "canonical_query": user_query,
                 "user_query": user_query,
-                "canonicalizer_used": False,
-                "canonicalizer_confidence": "skipped_routeable",
+                "translator_used": False,
+                "translator_confidence": "skipped_routeable",
                 "detected_language": "mixed_or_english",
                 "document_type": "routeable",
             }
 
-        if not needs_canonicalization(user_query):
-            print("Canonicalizer skipped: no multilingual normalization needed")
+        if not needs_translation(user_query):
+            print("Translator skipped: no multilingual normalization needed")
             return {
                 "original_query": user_query,
                 "canonical_query": user_query,
                 "user_query": user_query,
-                "canonicalizer_used": False,
-                "canonicalizer_confidence": "skipped_no_normalization_needed",
+                "translator_used": False,
+                "translator_confidence": "skipped_no_normalization_needed",
                 "detected_language": "english_or_mixed",
                 "document_type": "unknown",
             }
 
         response = await normalizer_llm.ainvoke([
-            SystemMessage(content=CANONICALIZER_PROMPT),
+            SystemMessage(content=TRANSLATOR_PROMPT),
             HumanMessage(content=user_query),
         ])
+        log_token_usage(response, "translator")
 
         data = extract_json_object(response.content)
 
@@ -363,27 +264,27 @@ async def canonicalizer_node(state: MainState) -> MainState:
         print("Original query:", user_query)
         print("Canonical query:", canonical_query)
         print("Detected language:", language)
-        print("Canonicalizer confidence:", confidence)
+        print("Translator confidence:", confidence)
 
         return {
             "original_query": user_query,
             "canonical_query": canonical_query,
             "user_query": canonical_query,
-            "canonicalizer_used": True,
-            "canonicalizer_confidence": confidence,
+            "translator_used": True,
+            "translator_confidence": confidence,
             "detected_language": language,
             "document_type": data.get("document_type", "unknown"),
         }
 
     except Exception as e:
-        print(f"Canonicalizer failed: {e}")
+        print(f"Translator failed: {e}")
         user_query = state.get("user_query", "") or ""
         return {
             "original_query": user_query,
             "canonical_query": user_query,
             "user_query": user_query,
-            "canonicalizer_used": False,
-            "canonicalizer_confidence": "low",
+            "translator_used": False,
+            "translator_confidence": "low",
             "detected_language": "unknown",
             "document_type": "unknown",
         }
@@ -727,17 +628,6 @@ async def semantic_search(state: MainState) -> MainState:
                 "skip_router": True,
             }
 
-        if is_unsupported_current_scope(user_query):
-            print("Unsupported query for current 6-tool scope. Skipping tool calls.")
-            return {
-                "retrieved_tools": [],
-                "selected_tools": [],
-                "query_parts": [user_query],
-                "skip_router": True,
-                "unsupported": True,
-                "unsupported_reason": "This query needs invoice/voucher tools, which are not enabled in the current 6-tool scope.",
-            }
-
         print(f"Original query: {original_query}")
         print(f"Canonical query: {canonical_query}")
         print(f"Document type: {document_type}")
@@ -753,15 +643,19 @@ async def semantic_search(state: MainState) -> MainState:
         print(f"Query parts for metadata matching: {query_parts}")
 
         selected_tool_groups: list[list[str]] = []
+        unsupported_parts: list[str] = []
         used_keyword_routing = False
 
         # -------------------------------------------------
-        # 1. Keyword/tool-domain routing first.
-        # If keyword routing finds a clear tool for a part,
-        # do not also run metadata for the same part because
-        # metadata can over-select noisy tools.
+        # 1. Check each part: skip unsupported invoice/voucher parts,
+        #    process supported parts through keyword/metadata routing.
         # -------------------------------------------------
         for part in query_parts:
+            if is_unsupported_current_scope(part):
+                print(f"Part '{part}' is unsupported (needs invoice/voucher tool). Skipping.")
+                unsupported_parts.append(part)
+                continue
+
             keyword_selected = keyword_tools_for_part(part)
 
             if keyword_selected:
@@ -781,7 +675,7 @@ async def semantic_search(state: MainState) -> MainState:
                 selected_tool_groups.append(tools_for_part)
 
         # -------------------------------------------------
-        # 2. Optional document_type hint from canonicalizer.
+        # 2. Optional document_type hint from translator.
         # This is additive only and does not override keyword tools.
         # -------------------------------------------------
         if document_type in {"product", "inventory", "stock"}:
@@ -801,7 +695,7 @@ async def semantic_search(state: MainState) -> MainState:
         if selected_tools:
             print(f"Final selected tools: {selected_tools}")
 
-            return {
+            result = {
                 "retrieved_tools": selected_tools,
                 "selected_tools": selected_tools,
                 "query_parts": query_parts,
@@ -809,10 +703,20 @@ async def semantic_search(state: MainState) -> MainState:
                 "skip_router": True,
             }
 
+            if unsupported_parts:
+                result["unsupported_parts"] = unsupported_parts
+                print(f"Unsupported parts (skipped): {unsupported_parts}")
+
+            return result
+
         # -------------------------------------------------
-        # 3. Fail fast instead of vector-guessing random tools.
-        # Re-enable vector fallback only after adding score thresholds.
+        # 3. No tools selected. Report unsupported.
         # -------------------------------------------------
+        reason = "No supported ERP tool matched this query."
+
+        if unsupported_parts:
+            reason = "This query needs invoice/voucher tools, which are not enabled in the current 6-tool scope."
+
         print("No confident tool match. Marking query unsupported.")
 
         return {
@@ -821,7 +725,8 @@ async def semantic_search(state: MainState) -> MainState:
             "query_parts": query_parts,
             "skip_router": True,
             "unsupported": True,
-            "unsupported_reason": "No supported ERP tool matched this query.",
+            "unsupported_parts": unsupported_parts,
+            "unsupported_reason": reason,
         }
 
     except Exception as e:
@@ -837,31 +742,74 @@ async def semantic_search(state: MainState) -> MainState:
 # ============================================
 # SYSTEM PROMPT
 # ============================================
+def _build_tool_desc(tool_name: str, meta: dict) -> str:
+    """One-line tool description for the system prompt."""
+    fields = meta.get("fields", [])
+    field_str = ",".join(fields[:5])
+    if len(fields) > 5:
+        field_str += "..."
+    return f"{tool_name}={meta.get('category', '')}: {meta.get('description', '')} Fields: [{field_str}]."
+
+
+def _build_field_examples(tool_name: str, meta: dict) -> list[str]:
+    """Generate field-usage examples from the registry for the system prompt."""
+    examples = []
+    triggers = get_field_triggers(tool_name)
+
+    for keyword, triggered_fields in triggers.items():
+        if keyword in ["name", "id", "category"]:
+            continue
+        if len(triggered_fields) <= 2:
+            default = meta.get("default_fields", [])
+            all_fields = list(dict.fromkeys(default + triggered_fields))
+            examples.append(
+                f"{keyword}=>{tool_name}(fields={json.dumps(all_fields, ensure_ascii=False)})"
+            )
+
+    return examples
+
+
 def build_system_prompt(
     user_query: str,
     selected_tools: list[str],
     query_parts: list[str] | None = None
 ) -> str:
-    return """
-Granite ERP tool-caller. Output tool_calls only; no text/markdown/final JSON. Use only bound tools. Call every tool needed by query, skip irrelevant bound tools. Never invent ids, dates, fields, filters, amounts, balances or records. Keep dates exact. fields=list[str]; filters=object; limit=10 unless all/more.
+    lines = [
+        "You are an ERP tool-caller. Output a JSON array of tool call objects.",
+        'Format: [{"name": "<tool>", "arguments": {<params>}}]',
+        "CRITICAL: Use tool names EXACTLY as listed under 'Available tools:' below. Never shorten, rename, or alias them.",
+        "Example: output {\"name\": \"get_tds_outstanding\"}, NOT \"tds_report\"; output {\"name\": \"get_customer_ledger\"}, NOT \"ledger\".",
+        "Never invent IDs, dates, amounts, names, or records. Extract values exactly from the query.",
+        "For multi-intent queries, include ALL required tools in the array. Do not skip any.",
+        "Dates must be YYYY-MM-DD. Customer IDs must be integers. Default limit=10.",
+        "Output ONLY the JSON array. No text, no markdown, no explanation.",
+        "",
+        "Available tools:",
+    ]
 
-Tools: get_customer=customer/party id,name,opening. get_customer_ledger=ledger/statement/opening,current,closing,transactions by customer_id. get_stock_levels=stock/product/HSN/qty/low/out stock. get_gst_summary=GST/GSTR/B2B/B2C/export/nil/tax/invoice amount. get_tds_outstanding=TDS outstanding/section. get_tcs_outstanding=TCS outstanding/section.
+    for tool_name in selected_tools:
+        meta = TOOL_INTENT_REGISTRY.get(tool_name)
+        if meta:
+            lines.append(f"  {_build_tool_desc(tool_name, meta)}")
 
-Rules:
-Customer+city=>search brand only, filter name contains CITY.
-Ex Nykaa Bangalore customer id=>get_customer(search="Nykaa",fields=["id","name"],filters={"name":{"contains":"BANGALORE"}}).
-Customer opening=>fields=["id","name","openingBalance","openingType"].
-If query asks customer and stock, call both.
-Ledger with customer id=>get_customer_ledger only. Ledger with name=>get_customer first if selected.
-Ledger balance=>fields=["ledgerName","opening","current","closing","period"]. Transactions/statement=>include "transactions".
-HSN X=>get_stock_levels(term=X,filters={"hsnCode":X},fields=["name","hsnCode","closingQty"]).
-closing value=>include closingValue. closing qty <N or >N=>use closingQty lt/gt filter.
-low stock=>low_stock_only=true. out stock=>filters={"isOutOfStock":true}.
-GST category filters use category: B2B=b2b, B2C Large=b2cLarge, B2C Small=b2cSmall, exports=exports, nil/exempt=nillRated, total/grand total=grandTotal.
-Single GST category=>filter category. Multiple GST categories=>do not use category filter; include requested fields and categories.
-B2B GST taxable IGST CGST SGST invoice amount=>fields=["category","name","taxableAmount","igst","cgst","sgst","invoiceAmount"].
-TDS/TCS section like 194C/194J/206C=>filters={"section":"194C"}.
-""".strip()
+    lines.append("")
+    lines.append("Field rules (keyword=>tool(fields=[...])):")
+
+    for tool_name in selected_tools:
+        meta = TOOL_INTENT_REGISTRY.get(tool_name)
+        if meta:
+            examples = _build_field_examples(tool_name, meta)
+            for ex in examples[:3]:
+                lines.append(f"  {ex}")
+
+    lines.append("")
+    lines.append("Tool-specific rules:")
+    for tool_name in selected_tools:
+        meta = TOOL_INTENT_REGISTRY.get(tool_name)
+        if meta and meta.get("prompt_tips"):
+            lines.append(f"  {tool_name}: {meta['prompt_tips']}")
+
+    return "\n".join(lines)
 
 
 def sec(start):
@@ -875,6 +823,19 @@ def ns_to_sec(value):
         return round(value / 1_000_000_000, 3)
     except Exception:
         return value
+
+
+def log_token_usage(response, label: str):
+    meta = getattr(response, "response_metadata", {}) or {}
+    tu = meta.get("token_usage", {}) or {}
+    prompt_tokens = tu.get("prompt_tokens") or meta.get("prompt_eval_count", 0)
+    output_tokens = tu.get("completion_tokens") or meta.get("eval_count", 0)
+    model = tu.get("model") or meta.get("model", "unknown")
+    model_provider = meta.get("model_provider", "")
+    tag = f"[TOKENS] {label}"
+    if model_provider:
+        tag += f" | provider={model_provider}"
+    print(f"{tag} | model={model} | input={prompt_tokens} | output={output_tokens} | total={prompt_tokens + output_tokens}")
 
 
 def print_ollama_metadata(response):
@@ -893,6 +854,281 @@ def print_ollama_metadata(response):
     print("eval_count:", metadata.get("eval_count"))
     print("=====================================\n")
 
+
+# ============================================
+# TOLERANT JSON PLANNER PARSER
+# ============================================
+def parse_planner_json_blocks(text: str) -> list:
+    """
+    Handles:
+    - single JSON object
+    - single JSON array
+    - markdown JSON fences
+    - multiple JSON arrays/objects in one response
+    """
+    if not text:
+        return []
+
+    cleaned = text.strip()
+    cleaned = cleaned.replace("```json", "").replace("```", "").strip()
+
+    # First try full JSON parse
+    try:
+        parsed = json.loads(cleaned)
+        return [parsed]
+    except Exception:
+        pass
+
+    # Extract multiple JSON arrays/objects
+    blocks = []
+    decoder = json.JSONDecoder()
+    idx = 0
+
+    while idx < len(cleaned):
+        while idx < len(cleaned) and cleaned[idx] not in "[{":
+            idx += 1
+
+        if idx >= len(cleaned):
+            break
+
+        try:
+            obj, end = decoder.raw_decode(cleaned[idx:])
+            blocks.append(obj)
+            idx += end
+        except Exception:
+            idx += 1
+
+    return blocks
+
+
+def normalize_tool_name(name: str) -> str:
+    if not name:
+        return ""
+
+    name = str(name).strip()
+
+    # Fix malformed names like "get_customer=brand:search:Nykaa&filters=..."
+    if "=" in name:
+        name = name.split("=", 1)[0].strip()
+
+    aliases = {
+        "stock_levels": "get_stock_levels",
+        "stock_report": "get_stock_levels",
+        "customer": "get_customer",
+        "customer_report": "get_customer",
+        "customer_ledger": "get_customer_ledger",
+        "gst_report": "get_gst_summary",
+        "tds_report": "get_tds_outstanding",
+        "tcs_report": "get_tcs_outstanding",
+    }
+
+    return aliases.get(name, name)
+
+
+def _extract_args_from_suffix(suffix: str) -> dict:
+    """
+    Extract args from a malformed tool-name suffix like:
+    'brand:search:Nykaa&filters:{"name":{"contains":"KOLKATA"}}'
+    Returns a dict of extracted args (generic, not tool-specific).
+    """
+    args = {}
+
+    if not suffix:
+        return args
+
+    # 1. Extract JSON content with its key prefix (handles filters:{...} etc.)
+    json_match = re.search(r"(\w+)[=:](\{.*\})", suffix, re.DOTALL)
+    if json_match:
+        key_name, json_str = json_match.group(1), json_match.group(2)
+        try:
+            parsed = json.loads(json_str)
+            if key_name in ("filters", "filter"):
+                args["filters"] = parsed
+            else:
+                args.update(parsed)
+        except Exception:
+            pass
+
+    # 2. Extract known simple params (search:Nykaa, term:48211090, limit:10, etc.)
+    known_params = {
+        "search", "term", "limit", "page", "customer_id",
+        "from_date", "to_date", "sort_field", "sort_order",
+        "low_stock_only",
+    }
+    for key in known_params:
+        if key in args:
+            continue
+        m = re.search(r'\b' + re.escape(key) + r'[=:](\S+?)(?:\b|&|$|\s)', suffix)
+        if m:
+            args[key] = m.group(1).rstrip(", ")
+
+    return args
+
+
+def normalize_planner_blocks(blocks: list) -> list[dict]:
+    calls = []
+
+    for block in blocks:
+        if isinstance(block, list):
+            raw_calls = block
+        elif isinstance(block, dict):
+            if block.get("unsupported") is True:
+                continue
+            raw_calls = (
+                block.get("tool_calls")
+                or block.get("tools")
+                or block.get("calls")
+                or [block]
+            )
+        else:
+            continue
+
+        for call in raw_calls:
+            if not isinstance(call, dict):
+                continue
+
+            raw_name = call.get("name") or call.get("tool") or ""
+            raw_args = call.get("args") or call.get("arguments") or {}
+
+            if not isinstance(raw_args, dict):
+                raw_args = {}
+
+            # Handle malformed names with embedded args: "get_customer=...suffix..."
+            if "=" in str(raw_name):
+                name_part, _, suffix = str(raw_name).partition("=")
+                embedded = _extract_args_from_suffix(suffix)
+                # Embedded args take priority over empty raw_args
+                if embedded and not raw_args:
+                    raw_args = embedded
+                elif embedded:
+                    raw_args = {**embedded, **raw_args}
+                raw_name = name_part
+
+            name = normalize_tool_name(raw_name)
+
+            if name:
+                calls.append({
+                    "name": name,
+                    "args": raw_args,
+                })
+
+    return calls
+
+
+def extract_date_ranges_with_positions(query: str) -> list[dict]:
+    pattern = r"\b\d{4}-\d{2}-\d{2}\b"
+    matches = list(re.finditer(pattern, query or ""))
+    ranges = []
+    for i in range(0, len(matches) - 1, 2):
+        ranges.append({
+            "from": matches[i].group(),
+            "to": matches[i + 1].group(),
+            "pos": matches[i].start(),
+        })
+    return ranges
+
+
+def nearest_date_range_to_keyword(query: str, keywords: list[str]) -> tuple[str, str]:
+    q_lower = (query or "").lower()
+    ranges = extract_date_ranges_with_positions(query)
+    if not ranges:
+        return "", ""
+    keyword_positions = []
+    for kw in keywords:
+        idx = q_lower.find(kw.lower())
+        if idx != -1:
+            keyword_positions.append(idx)
+    if not keyword_positions:
+        return ranges[0]["from"], ranges[0]["to"]
+    key_pos = min(keyword_positions)
+    selected = min(ranges, key=lambda r: abs(r["pos"] - key_pos))
+    return selected["from"], selected["to"]
+
+
+SEGMENT_NEXT_KEYWORDS = [
+    "nykaa", "customer id", "hsn", "gst", "b2b", "grand total",
+    "tds", "tcs", "sales invoice", "purchase invoice",
+    "ledger", "customer", "stock", "product",
+]
+
+
+def get_segment_for_tool(query: str, date_keywords: list[str]) -> str:
+    """Return the substring of query most relevant to a tool, bounded by
+    the next major tool keyword after this tool's first keyword match."""
+    q = query or ""
+    q_lower = q.lower()
+    positions = [q_lower.find(k) for k in date_keywords if q_lower.find(k) != -1]
+    if not positions:
+        return q
+    start = min(positions)
+    ends = []
+    for k in SEGMENT_NEXT_KEYWORDS:
+        idx = q_lower.find(k, start + 1)
+        if idx != -1 and idx > start:
+            ends.append(idx)
+    end = min(ends) if ends else len(q)
+    return q[start:end]
+
+
+def extract_date_range_for_tool(query: str, date_keywords: list[str]) -> tuple[str, str]:
+    """Find the first date range within the tool's query segment,
+    falling back to nearest-keyword on the full query."""
+    segment = get_segment_for_tool(query, date_keywords)
+    ranges = extract_date_ranges_with_positions(segment)
+    if ranges:
+        return ranges[0]["from"], ranges[0]["to"]
+    return nearest_date_range_to_keyword(query, date_keywords)
+
+
+STOP_TOKENS = {"KA", "CUSTOMER", "ID", "AUR", "NAAM", "BATAO", "BHI", "VALA", "DIKHAO", "KI", "KO", "KE", "KAA", "KA", "PAN"}
+
+
+def expand_customer_city_calls(base_name: str, base_args: dict, user_query: str) -> list[dict]:
+    """Create per-city get_customer calls when multiple known cities, or
+    filter by unknown location token when Nykaa + <unknown> is present."""
+    q_upper = (user_query or "").upper()
+    q_lower = (user_query or "").lower()
+    extra: list[dict] = []
+
+    if base_name != "get_customer":
+        return extra
+
+    if "NYKAA" not in q_upper:
+        return extra
+
+    matched_cities = [c for c in CITY_WORDS if c in q_upper]
+
+    if len(matched_cities) > 1:
+        for city in matched_cities:
+            city_args = dict(base_args)
+            city_args["filters"] = {"name": {"contains": city}}
+            extra.append({
+                "name": "get_customer",
+                "args": city_args,
+                "id": f"call_get_customer_{city.lower()}",
+                "type": "tool_call",
+            })
+        return extra
+
+    if not matched_cities and "NYKAA" in q_upper:
+        # Nykaa <unknown location> — prevent broad dump
+        after = q_upper.split("NYKAA", 1)[1]
+        tokens = re.findall(r"\b[A-Z]+\b", after)
+        unknown = next((t for t in tokens if t not in STOP_TOKENS), None)
+        if unknown:
+            filtered_args = dict(base_args)
+            filtered_args["filters"] = {"name": {"contains": unknown}}
+            extra.append({
+                "name": "get_customer",
+                "args": filtered_args,
+                "id": f"call_get_customer_{unknown.lower()}",
+                "type": "tool_call",
+            })
+            return extra
+
+    return extra
+
+
 @traceable(name="chat_model_node", run_type="llm")
 async def chat_model_node(state: MainState):
     node_start = now()
@@ -901,8 +1137,8 @@ async def chat_model_node(state: MainState):
         print("\n========== CHAT MODEL NODE START ==========")
 
         step = now()
-        original_query = state.get("user_query", "")
-        user_query = state.get("canonical_query") or original_query
+        original_query = state.get("original_query") or state.get("user_query", "")
+        user_query = state.get("canonical_query") or state.get("user_query", "")
         selected_tools = state.get("selected_tools", [])
         query_parts = state.get("query_parts", [user_query])
         loop_count = state.get("loop_count", 0)
@@ -939,14 +1175,7 @@ async def chat_model_node(state: MainState):
             }
 
         step = now()
-        if len(available_tools) == 1:
-            llm_with_tools = llm.bind_tools(
-                available_tools,
-                tool_choice=available_tools[0].name,
-            )
-        else:
-            llm_with_tools = llm.bind_tools(available_tools)
-        print(f"[3] Bound tools to LLM: {sec(step)}s")
+        print(f"[3] Using raw LLM (no bind_tools)")
 
         prompt_start = time.perf_counter()
         system_prompt_text = build_system_prompt(
@@ -972,13 +1201,13 @@ async def chat_model_node(state: MainState):
 
         step = now()
         print("[6] Invoking LLM...")
-        response = await llm_with_tools.ainvoke(llm_input)
+        response = await llm.ainvoke(llm_input)
         print(f"[6] LLM invoke completed: {sec(step)}s")
+        log_token_usage(response, "chat_model")
 
         print("\n========== RAW WORKER RESPONSE DEBUG ==========")
         print("response_type:", type(response).__name__)
         print("content:", repr(getattr(response, "content", "")))
-        print("tool_calls:", getattr(response, "tool_calls", None))
         print("additional_kwargs:", getattr(response, "additional_kwargs", {}))
         print("response_metadata:", getattr(response, "response_metadata", {}))
         print("==============================================\n")
@@ -986,7 +1215,207 @@ async def chat_model_node(state: MainState):
         print_ollama_metadata(response)
 
         content = getattr(response, "content", "")
-        tool_calls = getattr(response, "tool_calls", []) or []
+        tool_calls = []
+
+        # ---------- deterministic repair helpers ----------
+        TOOL_NAME_ALIASES = {
+            "tds_report": "get_tds_outstanding",
+            "tcs_report": "get_tcs_outstanding",
+            "gst_report": "get_gst_summary",
+            "customer_ledger": "get_customer_ledger",
+            "stock_levels": "get_stock_levels",
+            "stock_report": "get_stock_levels",
+            "customer_report": "get_customer",
+        }
+
+        def _apply_repair(name, args, user_query):
+            meta = TOOL_INTENT_REGISTRY.get(name, {})
+            repair = meta.get("repair")
+            if not repair:
+                return {"name": name, "args": args}
+
+            q_lower = (user_query or "").lower()
+            q_upper = (user_query or "").upper()
+            worker_has = {}
+            if args:
+                for dk in ("from_date", "to_date"):
+                    v = args.get(dk)
+                    if v and re.match(r"\d{4}-\d{2}-\d{2}", str(v)):
+                        worker_has[dk] = v
+            new_args = dict(repair.get("base_args", {})) if repair.get("overwrite") else dict(args or {})
+            # Preserve worker's valid dates (worker is more reliable than extraction)
+            for dk, dv in worker_has.items():
+                new_args[dk] = dv
+
+            for kw, kwar in repair.get("keyword_args", {}).items():
+                if kw.lower() in q_lower:
+                    new_args.update(kwar)
+
+            city_cfg = repair.get("city_filter")
+            if city_cfg:
+                matched = [c for c in CITY_WORDS if c in q_upper]
+                if len(matched) == 1:
+                    new_args["filters"] = {city_cfg.get("key", "name"): {"contains": matched[0]}}
+
+            if repair.get("hsn_extract"):
+                hsn_match = re.search(r"\b(\d{8})\b", user_query or "")
+                if hsn_match:
+                    hsn = hsn_match.group(1)
+                    new_args["term"] = hsn
+                    new_args["filters"] = {"hsnCode": hsn}
+                    fields = list(repair.get("default_fields", ["name", "id", "hsnCode", "closingQty"]))
+                    for kw, fld in repair.get("field_triggers", {}).items():
+                        if kw.lower() in q_lower and fld not in fields:
+                            fields.append(fld)
+                    new_args["fields"] = fields
+                    return {"name": name, "args": new_args}
+
+            cat_map = repair.get("category_map", {})
+            if cat_map:
+                matched = []
+                for kw, val in cat_map.items():
+                    if kw in q_lower:
+                        matched.append(val)
+                if len(matched) == 1:
+                    new_args["category"] = matched[0]
+                    new_args.pop("categories", None)
+                elif len(matched) > 1:
+                    new_args["categories"] = matched
+                    new_args.pop("category", None)
+
+            if repair.get("extract_customer_id"):
+                cm = re.search(r"customer\s*id\s*[:#-]?\s*(\d+)", user_query or "")
+                if cm:
+                    new_args["customer_id"] = int(cm.group(1))
+
+            date_kws = repair.get("date_keywords")
+            if date_kws and (not new_args.get("from_date") or not new_args.get("to_date")):
+                f, t = extract_date_range_for_tool(user_query, date_kws)
+                if f:
+                    new_args["from_date"] = f
+                    new_args["to_date"] = t
+
+            if repair.get("remove_filters"):
+                new_args.pop("filters", None)
+
+            for f in repair.get("prepend_fields", []):
+                fields = new_args.setdefault("fields", [])
+                if f not in fields:
+                    fields.insert(0, f)
+
+            strip = repair.get("strip_fields")
+            if strip:
+                fields = list(new_args.get("fields") or [])
+                new_args["fields"] = [f for f in fields if f not in strip]
+
+            fixed = repair.get("fixed_fields")
+            if fixed is not None:
+                new_args["fields"] = list(repair.get("default_fields", fixed))
+
+            for f in repair.get("ensure_fields", []):
+                if f not in new_args.get("fields", []):
+                    new_args.setdefault("fields", []).append(f)
+
+            field_triggers = repair.get("field_triggers", {})
+            if field_triggers:
+                fields = list(new_args.get("fields") or [])
+                for kw, fld in field_triggers.items():
+                    if kw.lower() in q_lower and fld not in fields:
+                        fields.append(fld)
+                new_args["fields"] = fields
+
+            strict_kws = repair.get("strict_field_keywords", {})
+            if strict_kws:
+                for kw_exact, narrow_fields in strict_kws.items():
+                    if kw_exact in q_lower:
+                        new_args["fields"] = list(narrow_fields)
+                        break
+
+            if "fields" in new_args and isinstance(new_args["fields"], list):
+                flds = new_args["fields"]
+                if "closingQuantity" in flds:
+                    flds[flds.index("closingQuantity")] = "closingQty"
+
+            if name == "get_gst_summary" or name in ("get_tds_outstanding", "get_tcs_outstanding"):
+                print(f"[{name.upper()} FINAL ARGS] {json.dumps(new_args, default=str)}")
+
+            return {"name": name, "args": new_args}
+
+        def _repair_tool_call(name: str, args: dict) -> dict | None:
+            name = TOOL_NAME_ALIASES.get(name, name)
+            if name not in tools_dict:
+                return None
+
+            for alias, canonical in [("date_from", "from_date"), ("date_to", "to_date"),
+                                       ("startDate", "from_date"), ("endDate", "to_date"),
+                                       ("fromDate", "from_date"), ("toDate", "to_date"),
+                                       ("start_date", "from_date"), ("end_date", "to_date")]:
+                if alias in args and canonical not in args:
+                    args[canonical] = args.pop(alias)
+
+            return _apply_repair(name, args, original_query)
+
+        # Parse tool calls using tolerant multi-block JSON parser
+        blocks = parse_planner_json_blocks(content)
+        planner_calls = normalize_planner_blocks(blocks)
+
+        for call in planner_calls:
+            repaired = _repair_tool_call(call["name"], call["args"])
+            if repaired:
+                tool_calls.append({
+                    "name": repaired["name"],
+                    "args": repaired["args"],
+                    "id": f"call_{repaired['name']}",
+                    "type": "tool_call",
+                })
+
+        # Expand multi-city customer calls and unknown-location filters
+        expanded = []
+        for call in tool_calls:
+            extra = expand_customer_city_calls(call["name"], call["args"], original_query)
+            if extra:
+                expanded.extend(extra)
+            else:
+                expanded.append(call)
+        tool_calls = expanded
+
+        if tool_calls:
+            # Deduplicate tool calls before execution
+            seen = set()
+            unique_calls = []
+            for call in tool_calls:
+                key = json.dumps({"name": call["name"], "args": call["args"]}, sort_keys=True, default=str)
+                if key not in seen:
+                    seen.add(key)
+                    unique_calls.append(call)
+            # Safety dedup: for non-customer tools, keep only first call per name
+            final_calls = []
+            seen_names = set()
+            for call in unique_calls:
+                if call["name"] == "get_customer" or call["name"] not in seen_names:
+                    seen_names.add(call["name"])
+                    final_calls.append(call)
+            tool_calls = final_calls
+            response.__dict__["tool_calls"] = tool_calls
+            print(f"[FIX] Extracted {len(tool_calls)} tool call(s) from LLM text output")
+
+        # Ensure TCS is called if query mentions TCS and tool is selected but missing
+        tcs_mentioned = "tcs" in (original_query or "").lower() or "tcs" in (user_query or "").lower()
+        if tcs_mentioned and "get_tcs_outstanding" in selected_tools:
+            if not any(call["name"] == "get_tcs_outstanding" for call in tool_calls):
+                dates = re.findall(r"\d{4}-\d{2}-\d{2}", original_query or "")
+                tcs_call = {
+                    "name": "get_tcs_outstanding",
+                    "args": {
+                        "from_date": dates[0] if len(dates) >= 1 else "",
+                        "to_date": dates[1] if len(dates) >= 2 else "",
+                        "fields": ["recordType", "name", "totalOutstanding", "period"],
+                    },
+                    "id": "call_get_tcs_outstanding",
+                    "type": "tool_call",
+                }
+                tool_calls.append(tcs_call)
+                print("[FIX] Injected missing TCS tool call")
 
         print("\n========== WORKER LLM RESPONSE ==========")
         print("response_type:", type(response).__name__)
@@ -1109,11 +1538,7 @@ def get_tool_name(tool_message, messages):
     return "unknown_tool"
 
 
-def make_summary(data: dict, errors: list) -> str:
-    """
-    Creates a simple deterministic summary.
-    """
-
+def make_summary(data: dict, errors: list, unsupported_parts: list | None = None) -> str:
     parts = []
 
     for tool_name, records in data.items():
@@ -1128,6 +1553,9 @@ def make_summary(data: dict, errors: list) -> str:
 
     if errors:
         parts.append(f"{len(errors)} error(s)")
+
+    if unsupported_parts:
+        parts.append(f"{len(unsupported_parts)} unsupported part(s)")
 
     return "; ".join(parts)
 
@@ -1249,131 +1677,16 @@ def apply_final_postprocessing(
 def infer_requested_fields(user_query: str, tool_name: str) -> list[str]:
     """
     Fallback projection only. Normal projection should come from tool args.
-    This keeps final JSON compact and prevents accidental full/raw dumps.
+    Uses TOOL_INTENT_REGISTRY as single source of truth.
     """
-    q = (user_query or "").lower()
-
-    if tool_name == "get_customer":
-        fields = ["id", "name"]
-
-        if "opening" in q or "opening balance" in q:
-            fields.extend(["openingBalance", "openingType"])
-
-        return list(dict.fromkeys(fields))
-
-    if tool_name == "get_customer_ledger":
-        fields = ["ledgerName", "opening", "current", "closing", "period"]
-
-        if any(word in q for word in ["transaction", "transactions", "statement", "entry", "entries"]):
-            fields.append("transactions")
-
-        return list(dict.fromkeys(fields))
-
-    if tool_name == "get_stock_levels":
-        fields = ["name"]
-
-        if "hsn" in q:
-            fields.append("hsnCode")
-
-        if any(word in q for word in ["stock", "qty", "quantity", "jaththo", "satha", "closing"]):
-            fields.append("closingQty")
-
-        if "sku" in q:
-            fields.append("sku")
-
-        if "value" in q:
-            fields.append("closingValue")
-
-        if "rate" in q:
-            fields.append("closingRate")
-
-        if "low stock" in q:
-            fields.append("isLowStock")
-
-        if "out of stock" in q:
-            fields.append("isOutOfStock")
-
-        return list(dict.fromkeys(fields))
-
-    if tool_name == "get_gst_summary":
-        fields = ["category", "name"]
-
-        asks_specific_field = False
-
-        if "voucher count" in q or "voucher" in q:
-            fields.append("voucherCount")
-            asks_specific_field = True
-
-        if "taxable" in q:
-            fields.append("taxableAmount")
-            asks_specific_field = True
-
-        if "igst" in q:
-            fields.append("igst")
-            asks_specific_field = True
-
-        if "cgst" in q:
-            fields.append("cgst")
-            asks_specific_field = True
-
-        if "sgst" in q:
-            fields.append("sgst")
-            asks_specific_field = True
-
-        if "cess" in q:
-            fields.append("cess")
-            asks_specific_field = True
-
-        # Important: do not treat "taxable" as "tax".
-        if re.search(r"\btax\b", q) or "total tax" in q:
-            fields.append("tax")
-            asks_specific_field = True
-
-        if "invoice amount" in q:
-            fields.append("invoiceAmount")
-            asks_specific_field = True
-
-        # Generic GST summary/report should return normal report columns.
-        if not asks_specific_field:
-            fields.extend([
-                "voucherCount",
-                "taxableAmount",
-                "igst",
-                "cgst",
-                "sgst",
-                "tax",
-                "invoiceAmount",
-            ])
-
-        return list(dict.fromkeys(fields))
-
-    if tool_name in {"get_tds_outstanding", "get_tcs_outstanding"}:
-        fields = ["recordType", "name"]
-
-        if "section" in q or re.search(r"\b(194c|194j|194i|206c)\b", q):
-            fields.append("section")
-
-        if "amount" in q:
-            fields.append("amount")
-            fields.append("totalAmount")
-
-        if "outstanding" in q or "pending" in q or "payable" in q:
-            fields.append("outstanding")
-            fields.append("totalOutstanding")
-
-        if "total" in q or "summary" in q:
-            fields.extend(["totalAmount", "totalOutstanding", "total_rows", "total_pages"])
-
-        fields.append("period")
-        return list(dict.fromkeys(fields))
-
-    return []
+    return infer_requested_fields_from_registry(user_query, tool_name)
 
 
 def compact_transactions(records: list[dict]) -> list[dict]:
     """
     Keep ledger transactions useful but prevent huge nested item dumps.
-    It removes nested `items` and adds itemCount instead.
+    Preserves ALL transaction fields dynamically; only replaces `items` with itemCount.
+    New API fields are automatically passed through.
     """
     compacted_records = []
 
@@ -1391,22 +1704,10 @@ def compact_transactions(records: list[dict]) -> list[dict]:
                 if not isinstance(txn, dict):
                     continue
 
-                items = txn.get("items", [])
-
-                compacted_txns.append({
-                    "id": txn.get("id"),
-                    "refId": txn.get("refId"),
-                    "date": txn.get("date"),
-                    "txMode": txn.get("txMode"),
-                    "txModeType": txn.get("txModeType"),
-                    "ledgerName": txn.get("ledgerName"),
-                    "invoiceNo": txn.get("invoiceNo"),
-                    "cr": txn.get("cr"),
-                    "dr": txn.get("dr"),
-                    "balance": txn.get("balance"),
-                    "narration": txn.get("narration"),
-                    "itemCount": len(items) if isinstance(items, list) else 0,
-                })
+                txn_copy = dict(txn)
+                items = txn_copy.pop("items", [])
+                txn_copy["itemCount"] = len(items) if isinstance(items, list) else 0
+                compacted_txns.append(txn_copy)
 
             new_record["transactions"] = compacted_txns
 
@@ -1424,11 +1725,13 @@ def project_records_by_fields(records: list, fields: list[str]) -> list:
         if not isinstance(record, dict):
             continue
 
-        projected.append({
-            field: record.get(field)
-            for field in fields
-            if field in record
-        })
+        row = {}
+        for field in fields:
+            if field in record:
+                row[field] = record[field]
+
+        if row:
+            projected.append(row)
 
     return projected
 
@@ -1545,13 +1848,13 @@ async def deterministic_final_node(state: MainState):
                 f"{user_query or ''} {canonical_query or ''}",
             )
 
-        fallback_fields = infer_requested_fields(user_query, tool_name)
-        records = project_records_by_fields(records, fallback_fields)
-
         if tool_name == "get_customer_ledger":
             records = compact_transactions(records)
 
         data.setdefault(tool_name, [])
+        # Deduplicate records by id or full content
+        existing_ids = {r.get("id") for r in data[tool_name] if isinstance(r, dict) and r.get("id") is not None}
+        records = [r for r in records if not (isinstance(r, dict) and r.get("id") is not None and r["id"] in existing_ids)]
         data[tool_name].extend(records)
 
     # -------------------------------------------------
@@ -1563,6 +1866,8 @@ async def deterministic_final_node(state: MainState):
     canonical_query,
 )
 
+    unsupported_parts = state.get("unsupported_parts", [])
+
     has_any_data = any(
         isinstance(records, list) and len(records) > 0
         for records in data.values()
@@ -1573,7 +1878,11 @@ async def deterministic_final_node(state: MainState):
         for records in data.values()
     )
 
-    if errors and has_any_data:
+    if unsupported_parts:
+        status = "partial_success"
+        success = bool(has_any_data)
+
+    elif errors and has_any_data:
         status = "partial_success"
         success = True
 
@@ -1599,12 +1908,15 @@ async def deterministic_final_node(state: MainState):
         "query": user_query,
         "tools_used": tools_used,
         "data": data,
-        "summary": make_summary(data, errors),
+        "summary": make_summary(data, errors, unsupported_parts),
         "errors": errors,
     }
 
+    if unsupported_parts:
+        final_response["unsupported_parts"] = unsupported_parts
+
     return {
-        "final_response": json.dumps(final_response, ensure_ascii=False),
+        "final_response": final_response,
         "tools_utilized": tools_used,
     }
 # ============================================
@@ -1615,121 +1927,3 @@ tools_node = ToolNode(tools)
 
 
 
-#A new router node is being added since we will use the new router llm which is a small llm and we will use it to do our basic work that way we can make 
-# a more simpler prompt for our main llm
-@traceable(name="router_node", run_type="chain")
-async def router_node(state: MainState):
-    """
-    Small model router:
-    - Receives user query
-    - Receives tools retrieved by semantic search
-    - Selects only required tools
-    - Does NOT answer the user
-    """
-
-    print("Router node called")
-
-    user_query = state.get("canonical_query") or state.get("user_query", "")
-    retrieved_tools = [
-        tool_name for tool_name in state.get("retrieved_tools", [])
-        if tool_name in tools_dict
-    ]
-
-    if not retrieved_tools:
-        return {
-            "router_decision": {
-                "route": "unsupported",
-                "required_tools": [],
-                "query_parts": [user_query],
-                "confidence": 0.0,
-                "reason": "No tools were retrieved.",
-            },
-            "selected_tools": [],
-            "query_parts": [user_query],
-        }
-
-    router_prompt = """
-You are a strict ERP/accounting router.
-
-USER QUERY:
-__USER_QUERY__
-
-AVAILABLE TOOLS:
-__RETRIEVED_TOOLS__
-
-JOB:
-Select required tools only from AVAILABLE TOOLS.
-Do not answer. Do not call tools. Return only raw JSON.
-
-JSON FORMAT:
-{
-  "route": "tool_worker",
-  "required_tools": [],
-  "query_parts": [],
-  "confidence": 0.0,
-  "reason": ""
-}
-
-RULES:
-- required_tools must only contain names from AVAILABLE TOOLS.
-- Multi-part ERP query => select all matching tools.
-- customer/customer id/party/opening balance -> get_customer
-- ledger/account statement/customer transactions/closing balance -> get_customer_ledger
-- stock/inventory/product/HSN/SKU/closing quantity/low stock/out of stock -> get_stock_levels
-- If no available tool can answer, use route "unsupported" and required_tools=[].
-- Never invent tool names.
-- When AVAILABLE TOOLS has multiple tools for a multi-intent query, prefer keeping all of them.
-"""
-
-    router_prompt = (
-        router_prompt
-        .replace("__USER_QUERY__", user_query)
-        .replace("__RETRIEVED_TOOLS__", str(retrieved_tools))
-    )
-
-    messages = [
-        SystemMessage(content=router_prompt),
-        HumanMessage(content=user_query),
-    ]
-
-    try:
-        response = await router_llm.ainvoke(messages)
-        decision = json.loads(response.content)
-
-    except Exception as e:
-        print(f"Router parse/error fallback: {e}")
-
-        decision = {
-            "route": "tool_worker",
-            "required_tools": retrieved_tools,
-            "query_parts": state.get("query_parts", [user_query]),
-            "confidence": 0.5,
-            "reason": "Router failed, falling back to retrieved tools.",
-        }
-
-    route = decision.get("route", "tool_worker")
-    required_tools = [
-        tool_name for tool_name in decision.get("required_tools", [])
-        if tool_name in retrieved_tools
-    ]
-
-    if route == "unsupported":
-        selected_tools = []
-    else:
-        selected_tools = required_tools or retrieved_tools
-
-        if len(retrieved_tools) > 1 and len(selected_tools) < len(retrieved_tools):
-            selected_tools = retrieved_tools
-            decision["required_tools"] = retrieved_tools
-            decision["reason"] = (
-                str(decision.get("reason", ""))
-                + " | Multi-intent safety kept all retrieved tools."
-            ).strip()
-
-    print("Router selected tools:", selected_tools)
-
-    return {
-        "router_decision": decision,
-        "selected_tools": selected_tools,
-        "query_parts": decision.get("query_parts", state.get("query_parts", [user_query])),
-    }

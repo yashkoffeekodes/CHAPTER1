@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from src.graph import graph_builder
@@ -12,8 +15,6 @@ from typing import Any, Dict, List
 
 import uvicorn
 import uuid
-from dotenv import load_dotenv
-load_dotenv()
 
 app = FastAPI(
     title="CHAPTER-1-ASSIST",
@@ -132,34 +133,6 @@ class ChatResponse(BaseModel):
     total_time_sec: float   
 
 
-def parse_json_safely(text: str):
-    """
-    Safely parse JSON from a string.
-    Works for raw JSON and accidental markdown-wrapped JSON.
-    """
-
-    if not text:
-        return None
-
-    cleaned = text.strip()
-    cleaned = cleaned.replace("```json", "").replace("```", "").strip()
-
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-
-    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-
-    if match:
-        try:
-            return json.loads(match.group(0))
-        except json.JSONDecodeError:
-            pass
-
-    return None
-
-
 def make_error_response(
     user_query: str,
     status: str,
@@ -223,8 +196,8 @@ async def run_graph_query(
     initial_state = {
         "user_query": user_query,
         "canonical_query": "",
-        "canonicalizer_used": False,
-        "canonicalizer_confidence": "",
+        "translator_used": False,
+        "translator_confidence": "",
         "detected_language": "",
         "messages": [],
         "retrieved_tools": [],
@@ -307,11 +280,9 @@ async def run_graph_query(
                         if content:
                             final_response = make_error_response(
                                 user_query=user_query,
-                                status="no_tool_call",
+                                status="unsupported",
                                 summary=content,
-                                errors=[
-                                    "chat_model returned text instead of actual tool_calls. The graph ended before tools/deterministic_final."
-                                ],
+                                errors=[],
                                 tools_used=tools_requested,
                             )
 
@@ -321,30 +292,13 @@ async def run_graph_query(
 
                         if isinstance(final_response_raw, dict):
                             final_response = final_response_raw
-
-                        elif isinstance(final_response_raw, str):
-                            parsed = parse_json_safely(final_response_raw)
-
-                            if parsed is not None:
-                                final_response = parsed
-                            else:
-                                final_response = make_error_response(
-                                    user_query=user_query,
-                                    status="invalid_final_json",
-                                    summary=final_response_raw,
-                                    errors=[
-                                        "deterministic_final returned invalid JSON."
-                                    ],
-                                    tools_used=tools_utilized,
-                                )
-
                         else:
                             final_response = make_error_response(
                                 user_query=user_query,
                                 status="missing_final_response",
-                                summary="deterministic_final did not return final_response.",
+                                summary="deterministic_final did not return a valid response.",
                                 errors=[
-                                    "No final_response found in deterministic_final node output."
+                                    "No final_response dict found in deterministic_final node output."
                                 ],
                                 tools_used=tools_utilized,
                             )
@@ -436,12 +390,10 @@ async def chat(request: ChatRequest):
             "fastapi",
             "langgraph",
             "erp-assistant",
-            "granite4.1:8b",
         ],
         "metadata": {
             "request_id": request_id,
             "query": request.query,
-            "model": "granite4.1:8b",
         },
     }
 

@@ -22,11 +22,12 @@ class MainState(TypedDict):
     selected_tools: List[str]
     query_parts: List[str]
     canonical_query: str
-    canonicalizer_used: bool
-    canonicalizer_confidence: str
+    translator_used: bool
+    translator_confidence: str
     document_type: str # to map to our sales/purchase/product tools
     detected_language: str
     skip_router: bool
+    unsupported_parts: list[str]
 
 
 class OutputState(TypedDict):
