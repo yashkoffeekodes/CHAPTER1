@@ -1,7 +1,7 @@
 from src.schema import MainState
 from src.tools_api import tools_dict, tools
 from src.tool_doc import TOOL_INTENT_REGISTRY, TOOL_NAME_ALIASES, get_field_triggers, infer_requested_fields_from_registry, CITY_WORDS
-from src.config import llm, normalizer_llm, get_cfg
+from src.config import llm, normalizer_llm, summary_llm, get_cfg
 import time
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
 from langgraph.prebuilt import ToolNode
@@ -405,6 +405,15 @@ async def semantic_search(state: MainState) -> MainState:
             if keyword_tools:
                 print(f"Keyword fallback tools for part '{part}': {keyword_tools}")
                 selected_tool_groups.append(keyword_tools)
+                continue
+
+            # If part contains a known city name, route to get_customer
+            # (e.g. "how many custormers in kolkata" splits to "punjab?" which
+            # matches no tool description, but is clearly a customer query.)
+            part_upper = part.upper()
+            if any(city in part_upper for city in CITY_WORDS):
+                print(f"City-name fallback for part '{part}': routing to get_customer")
+                selected_tool_groups.append(["get_customer"])
 
         # Optional document_type hint from translator (additive only).
         if document_type in {"product", "inventory", "stock"}:
@@ -1693,12 +1702,166 @@ def filter_gst_records_by_query(records: list[dict], query: str) -> list[dict]:
     if not requested:
         return records
 
+    # If records were already projected (no category field left), skip filtering
+    if records and isinstance(records[0], dict) and "category" not in records[0]:
+        return records
+
     requested_set = set(requested)
 
     return [
         record for record in records
         if isinstance(record, dict) and record.get("category") in requested_set
     ]
+
+
+async def generate_llm_summary(
+    query: str,
+    data: dict,
+    errors: list,
+    unsupported_parts: list | None,
+    detected_language: str,
+    raw_responses: dict | None = None,
+) -> str:
+    """
+    Generates a natural language summary using the LLM.
+    Falls back to make_summary if the LLM call fails.
+    """
+    compact_data = {}
+    for tool_name, records in data.items():
+        if not isinstance(records, list):
+            compact_data[tool_name] = {"count": 0, "samples": []}
+            continue
+        samples = records[:10]
+        rest_count = len(records) - len(samples)
+        compact_data[tool_name] = {
+            "count": len(records),
+            "samples": samples,
+            "additional_count": rest_count,
+        }
+
+    language_instruction = (
+        "Respond in Hinglish — Hindi words written in Roman/English script mixed with English ERP terms. "
+        "CRITICAL: Write ALL Hindi/connector words in Roman script (English letters), NOT in Devanagari script.\n"
+        "  Correct: 'ye hai', 'ke liye', 'aur', 'ka', 'hai', 'tum kaise ho'\n"
+        "  Wrong: 'ये है', 'के लिए', 'और', 'का', 'है', 'तुम कैसे हो'\n"
+        "Use English for ERP field names (vouchers, taxable amount, IGST, CGST, SGST, "
+        "bill amount, grand total, customers, closing quantity, id, name). "
+        "Use Hindi in Roman script for connectors and grammar.\n"
+        "Example output:\n"
+        "  'B2B ke liye 15 vouchers hai, taxable amount 246261.38 hai, IGST 44327.27 hai...'\n"
+        "  NOT 'B2B के लिए 15 वॉचर है...'\n"
+        "Do NOT use pure English. Do NOT use Devanagari script."
+    )
+
+    raw_summary_text = ""
+    if raw_responses:
+        raw_summary_parts = []
+        tracked_meta_keys = {"total_rows", "total_pages", "period", "ledgerName",
+                             "openingBalance", "closingBalance"}
+
+        for tool_name, raw in raw_responses.items():
+            if not isinstance(raw, dict):
+                continue
+
+            # Collect names from actual filtered data records
+            data_names = set()
+            tool_records = data.get(tool_name, [])
+            if isinstance(tool_records, list):
+                for r in tool_records:
+                    if isinstance(r, dict) and r.get("name"):
+                        data_names.add(r["name"])
+
+            matched_sub_count = 0
+            raw_data = raw.get("data")
+
+            for key, val in raw.items():
+                # ── raw_data dict (GST categories) — name-match sub-entries ──
+                if key == "data" and isinstance(val, dict):
+                    for sub_key, sub_val in val.items():
+                        if isinstance(sub_val, dict):
+                            sub_name = sub_val.get("name")
+                            if not sub_name or sub_name in data_names:
+                                raw_summary_parts.append(f"{tool_name}/{sub_key}: {json.dumps(sub_val)}")
+                                if sub_name:
+                                    matched_sub_count += 1
+                # ── Other dict values (summary, period, etc.) ──
+                elif isinstance(val, dict) and key not in ("data", "grandTotal"):
+                    dict_name = val.get("name")
+                    # Include if no name (inherently scoped) OR name matches data
+                    if not dict_name or dict_name in data_names:
+                        raw_summary_parts.append(f"{tool_name} {key}: {json.dumps(val)}")
+                        if dict_name:
+                            matched_sub_count += 1
+                # ── Scalar metadata ──
+                elif key in tracked_meta_keys and val is not None:
+                    raw_summary_parts.append(f"{tool_name} {key}: {json.dumps(val)}")
+
+            # Include grandTotal only when multiple sub-entries were matched (full-scope query)
+            if matched_sub_count > 1:
+                gt = raw.get("grandTotal")
+                if isinstance(gt, dict):
+                    raw_summary_parts.append(f"{tool_name} grandTotal: {json.dumps(gt)}")
+
+            # ── List raw_data — include samples when filtered data is empty/stripped ──
+            if isinstance(raw_data, list) and len(raw_data) > 0:
+                filtered_count = len(data.get(tool_name, [])) if isinstance(data.get(tool_name, []), list) else 0
+                if filtered_count == 0:
+                    samples = raw_data[:10]
+                    rest = len(raw_data) - len(samples)
+                    text = f"{tool_name} raw records ({len(raw_data)} total): {json.dumps(samples)}"
+                    if rest > 0:
+                        text += f" ... and {rest} more"
+                    raw_summary_parts.append(text)
+
+        if raw_summary_parts:
+            raw_summary_text = "\n".join(raw_summary_parts)
+
+    # Build human message parts
+    human_parts = [f"Original user query: {query}"]
+
+    if raw_summary_text:
+        human_parts.append(
+            "Actual data with all fields:\n"
+            f"{raw_summary_text}"
+        )
+
+    human_parts.append(
+        "Record counts per tool:\n"
+        f"{json.dumps(compact_data, default=str, indent=2)}"
+    )
+
+    human_parts.append(
+        f"Errors: {json.dumps(errors)}\n"
+        f"Unsupported parts: {json.dumps(unsupported_parts or [])}"
+    )
+
+    # Add language reminder as LAST thing in human message (recency)
+    lang_suffix = "\n\nIMPORTANT: Use Hinglish (Hindi in Roman script + English ERP terms). No Devanagari."
+    human_content = "\n\n".join(human_parts) + lang_suffix
+
+    try:
+        response = await summary_llm.ainvoke([
+            SystemMessage(content=(
+                "You format ERP query results into a natural, helpful response.\n"
+                "Rules:\n"
+                f"{language_instruction}\n"
+                "- Output ONLY the response text. No reasoning, no thinking, no notes, no markdown, no prefixes.\n"
+                "- The 'Actual data with all fields' section contains the REAL values. Use those to answer.\n"
+                "- The 'Record counts per tool' section is just for counts and sample names.\n"
+                "- Include relevant numbers from the Actual data section. Be concise but specific.\n"
+                "- Never add information not present in the data.\n"
+                "- If there are errors, mention them briefly.\n"
+                "- If there are unsupported parts, mention them."
+            )),
+            HumanMessage(content=human_content),
+        ])
+        log_token_usage(response, "summary_generator")
+        return response.content
+    except Exception as e:
+        print(f"[LLM Summary] Failed, falling back to make_summary: {e}")
+        return make_summary(data, errors, unsupported_parts)
+
+
 # ============================================
 # DETERMINISTIC FINAL NODE
 # ============================================
@@ -1711,11 +1874,14 @@ async def deterministic_final_node(state: MainState):
 
     user_query = state.get("user_query", "")
     canonical_query = state.get("canonical_query", "")
+    original_query = state.get("original_query", user_query)
+    detected_language = state.get("detected_language", "english")
     messages = state.get("messages", [])
 
     data = {}
     tools_used = []
     errors = []
+    raw_responses = {}
 
     tool_messages = [
         msg for msg in messages
@@ -1775,6 +1941,7 @@ async def deterministic_final_node(state: MainState):
             records = compact_transactions(records)
 
         data.setdefault(tool_name, [])
+        raw_responses[tool_name] = parsed.get("raw_response", {})
 
         # Deduplicate records by id or full content
         existing_ids = {r.get("id") for r in data[tool_name] if isinstance(r, dict) and r.get("id") is not None}
@@ -1832,7 +1999,7 @@ async def deterministic_final_node(state: MainState):
         "query": user_query,
         "tools_used": tools_used,
         "data": data,
-        "summary": make_summary(data, errors, unsupported_parts),
+        "summary": await generate_llm_summary(original_query, data, errors, unsupported_parts, detected_language, raw_responses),
         "errors": errors,
     }
 
