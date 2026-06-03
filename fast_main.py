@@ -14,7 +14,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import RemoveMessage,SystemMessage, HumanMessage
 
 from src.graph import graph_builder
 from src.config import llm, normalizer_llm, get_cfg
@@ -168,22 +168,47 @@ async def format_response_as_chat_text(
     **kwargs,
 ) -> str:
     """
-    Returns the LLM-generated summary directly.
-    The summary is now produced inside deterministic_final_node by an LLM.
+    Converts deterministic JSON into a clean conversational sentence.
+    This is response formatting only. It is not conversation summarization.
     """
     status = response_data.get("status", "")
     summary = response_data.get("summary", "")
+    query = response_data.get("query", "")
+    data = response_data.get("data", {})
 
     if status == "needs_clarification":
-        return f"ℹ️ {summary}" if summary else "ℹ️ Could you please clarify your request with a specific name or ID?"
+        return f"ℹ️ {summary if summary else 'Could you please clarify your request with a specific name or ID?'}"
 
-    return summary or "No summary available."
+    if status == "no_matching_records":
+        return "I checked your ERP records but couldn't find any matching data for that description."
+
+    if not data:
+        return "I encountered an issue retrieving those records right now."
+
+    lines = []
+    for tool_name, records in data.items():
+        if not isinstance(records, list) or not records:
+            continue
+        label = get_tool_display_name(tool_name)
+        lines.append(f"\n--- {label} ---")
+        for i, record in enumerate(records, 1):
+            if not isinstance(record, dict):
+                lines.append(f"{i}. {record}")
+                continue
+            parts = [pretty_field_name(k) + ": " + str(v) for k, v in record.items() if v is not None]
+            if parts:
+                lines.append(f"{i}. " + ", ".join(parts))
+            else:
+                lines.append(f"{i}. (empty record)")
+
+    return "\n".join(lines) if lines else "No data found."
 
 
 async def run_graph_query(
     user_query: str,
     past_messages: list = None,
     langsmith_config: dict | None = None,
+    past_summary: str | None = None,
 ):
     cached_result = get_cached_final_response(user_query)
     if cached_result is not None:
@@ -211,18 +236,22 @@ async def run_graph_query(
         "step_timings": [],
         "document_type": "",
         "unsupported_parts": [],
+        "summary": past_summary or "",
     }
 
     final_response = None
     timings = []
     tools_requested = []
     messages_tracker = list(initial_state["messages"])
-
+    config = langsmith_config or {}
+    session_id = config.get("metadata", {}).get("session_id", "default_session")
+    config["configurable"] = {"thread_id": session_id}
     try:
+        summary_tracker = past_summary or ""
         async with asyncio.timeout(GRAPH_TIMEOUT_SECONDS):
             async for chunks in graph.astream(
                 initial_state,
-                config=langsmith_config or {},
+                config=config,
                 stream_mode="updates",
             ):
                 for node_name, state_update in chunks.items():
@@ -236,9 +265,12 @@ async def run_graph_query(
                     # Save all returned messages. No summarization or trimming is applied.
                     if "messages" in state_update:
                         for msg in state_update["messages"]:
-                            if msg not in messages_tracker:
+                            if isinstance(msg, RemoveMessage):
+                                messages_tracker = [m for m in messages_tracker if m.id != msg.id]
+                            elif msg not in messages_tracker:
                                 messages_tracker.append(msg)
-
+                    if "summary" in state_update and state_update["summary"]:
+                        summary_tracker = state_update["summary"]
                     if node_name == "chat_model":
                         messages = state_update.get("messages", [])
                         if not messages:
@@ -305,6 +337,7 @@ async def run_graph_query(
             "timings": timings,
             "total_time_sec": total_time,
             "updated_messages": messages_tracker,
+            "summary": past_summary or "",
         }
 
     except Exception as e:
@@ -320,8 +353,9 @@ async def run_graph_query(
             "timings": timings,
             "total_time_sec": total_time,
             "updated_messages": messages_tracker,
+            "summary": summary_tracker or "",
         }
-
+    print(f"[Remove Messages Result] total messages tracked:{len(messages_tracker)}. Final summary: {summary_tracker}")
     total_time = round(time.perf_counter() - start_time, 3)
 
     if final_response is None:
@@ -338,6 +372,7 @@ async def run_graph_query(
         "timings": timings,
         "total_time_sec": total_time,
         "updated_messages": messages_tracker,
+        "summary": summary_tracker,
     }
 
     set_cached_final_response(user_query, result)
@@ -375,16 +410,18 @@ async def chat(request: ChatRequest, fmt: Optional[str] = Query(None, alias="for
 
     try:
         session_id = request.session_id or "default_session"
-        session_data = SESSION_MEMORY.get(session_id, {"messages": []})
+        session_data = SESSION_MEMORY.get(session_id, {"messages": [], "summary": ""})
 
         result = await run_graph_query(
             user_query=request.query,
             past_messages=session_data.get("messages", []),
+            past_summary=session_data.get("summary", ""),
             langsmith_config=langsmith_config,
         )
 
         SESSION_MEMORY[session_id] = {
             "messages": result.get("updated_messages", []),
+            "summary": result.get("summary","")
         }
 
         output_format = fmt or DEFAULT_OUTPUT_FORMAT
@@ -426,16 +463,18 @@ async def chat_text(request: ChatRequest):
 
     try:
         session_id = request.session_id or "default_session"
-        session_data = SESSION_MEMORY.get(session_id, {"messages": []})
+        session_data = SESSION_MEMORY.get(session_id, {"messages": [], "summary": ""})
 
         result = await run_graph_query(
             user_query=request.query,
             past_messages=session_data.get("messages", []),
+            past_summary=session_data.get("summary", ""),
             langsmith_config=langsmith_config,
         )
 
         SESSION_MEMORY[session_id] = {
             "messages": result.get("updated_messages", []),
+            "summary": result.get("summary","")
         }
 
         text = await format_response_as_chat_text(
