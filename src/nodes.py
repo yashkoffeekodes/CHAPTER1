@@ -7,6 +7,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, Tool
 from langgraph.prebuilt import ToolNode
 import json
 import re
+import uuid
 from langsmith import traceable
 
 import numpy as np
@@ -30,20 +31,41 @@ LIST_WORDS = get_cfg("list_words", default=[])
 
 # ── Embedding recall + cross-encoder reranker for tool routing ──
 _tool_embeddings: dict[str, list[float]] = {}
-_cross_encoder: CrossEncoder
+_cross_encoder: CrossEncoder | None = None
+_cross_encoder_ready = False
+
+def ensure_cross_encoder():
+    """Eagerly load the cross-encoder model to avoid cold-start latency on first query.And is called on appp startup"""
+    global _cross_encoder, _cross_encoder_ready
+    if not _cross_encoder_ready:
+        _cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
+        _cross_encoder_ready = True
+
+def get_cross_encoder():
+    """Fallback getter for cross-encoder, in case ensure_cross_encoder() was not called on startup."""
+    ensure_cross_encoder()
+    return _cross_encoder
 
 def _cosine_sim(a: list[float], b: list[float]) -> float:
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 def _build_tool_embeddings():
+    if _tool_embeddings:
+        return
     for tool_name, meta in TOOL_INTENT_REGISTRY.items():
         text = f"{meta['description']} {' '.join(meta.get('aliases', []))} {' '.join(meta.get('keywords', []))}"
         _tool_embeddings[tool_name] = embedding_model.embed_query(text)
 
-_build_tool_embeddings()
 
 # Eager load cross-encoder at import time (not lazy — avoids cold-start latency on first query)
-_cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
+# _cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
+
+def get_cross_encoder():
+    global _cross_encoder
+    if _cross_encoder is None:
+        _cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
+    return _cross_encoder
+
 
 def now():
     return time.perf_counter()
@@ -258,7 +280,7 @@ def score_tools_via_reranker(query_part: str, registry: dict) -> list[str]:
         desc = f"{tool_name}: {meta.get('description', '')}. Aliases: {', '.join(meta.get('aliases', []))}"
         pairs.append((query_part, desc))
 
-    rerank_scores = _cross_encoder.predict(pairs)
+    rerank_scores = get_cross_encoder().predict(pairs)
     reranked = [(top_k[i][0], float(rerank_scores[i])) for i in range(len(top_k))]
     reranked.sort(key=lambda x: x[1], reverse=True)
 
@@ -391,6 +413,25 @@ async def semantic_search(state: MainState) -> MainState:
 
         print(f"Query parts for metadata matching: {query_parts}")
 
+        # Detect meta-questions about the conversation itself — no tool needed
+        META_QUESTION_PATTERNS = [
+            r"what (have|did) we (discussed?|talked?|said?|done|covered|asked)",
+            r"which (products|items|customers) (have|were) (discussed|talked|mentioned)",
+            r"what (was|were) (discussed|talked|mentioned|said)",
+            r"(summarize|summary|recap) (the |our |this )?(conversation|chat|discussion)",
+            r"conversation (history|so far|till now)",
+            r"kya (baat|discuss|hua|kaha)",
+            r"humne kya (baat|discuss|kiya|kaha|kari)",
+        ]
+        if any(re.search(p, user_query, re.IGNORECASE) for p in META_QUESTION_PATTERNS):
+            print(f"Meta-question detected — no tool needed: {user_query}")
+            return {
+                "retrieved_tools": [],
+                "selected_tools": [],
+                "query_parts": query_parts,
+                "skip_router": True,
+            }
+
         selected_tool_groups: list[list[str]] = []
 
         for part in query_parts:
@@ -430,6 +471,22 @@ async def semantic_search(state: MainState) -> MainState:
                 "query_parts": query_parts,
                 "skip_router": True,
             }
+
+        # Fallback: use tool from conversation history (follow-up queries)
+        messages = state.get("messages", [])
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+                for tc in msg.tool_calls:
+                    tool_name = tc.get("name")
+                    if tool_name and tool_name in tools_dict:
+                        print(f"No tool match for query. Using tool from conversation history: {tool_name}")
+                        selected_tools = [tool_name]
+                        return {
+                            "retrieved_tools": selected_tools,
+                            "selected_tools": selected_tools,
+                            "query_parts": query_parts,
+                            "skip_router": True,
+                        }
 
         print("No confident tool match. Marking query unsupported.")
 
@@ -481,11 +538,30 @@ def _build_field_examples(tool_name: str, meta: dict) -> list[str]:
 
     return examples
 
+def _get_recent_tool_calls(messages: list, max_calls: int = 3) -> list[dict]:
+    """Return the most recent distinct tool calls from AIMessages, newest first."""
+    calls = []
+    seen = set()
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            for tc in msg.tool_calls:
+                name = tc.get("name")
+                args = tc.get("args", {})
+                if name and args and name not in seen:
+                    calls.append({"name": name, "args": args})
+                    seen.add(name)
+                    if len(calls) >= max_calls:
+                        return calls
+    return calls
+
+
 def build_system_prompt(
     user_query: str,
     selected_tools: list[str],
     query_parts: list[str] | None = None,
     summary: str | None = None,
+    messages: list | None = None,
+    last_tool_call: dict | None = None,
 ) -> str:
     lines = [
         "You are an ERP assistant. Use the available tools to answer the user.",
@@ -496,8 +572,40 @@ def build_system_prompt(
         "Set `fields` to only the columns the user explicitly asks for. "
         'E.g. "sirf name" → fields=["name"]; "name and cgst" → fields=["name","cgst"]. '
         "Omit `fields` if user doesn't specify any columns.",
+        "",
+        "FOLLOW-UP RULES:",
+        "- Reuse the search term and filters only if the new query is a follow-up about the same specific entity. If the topic or scope changes (e.g. switching to a different search or asking a general/broad question), clear them.",
+        "- When the user asks for additional fields (e.g. 'id' after previously asking for 'name'),",
+        "  KEEP the previous fields and ADD the new ones. Never remove previously requested fields.",
+        "- If the answer is already in previous tool results, use it directly without a new API call.",
+        "- When a tool has sort_field/sort_order parameters and the user asks for extreme/comparative values (highest, most, least, top, bottom, etc.), ALWAYS set sort_field to the field being compared and sort_order accordingly: 'desc' for highest/most/top, 'asc' for lowest/least/bottom.",
     ]
 
+    if messages:
+        recent_calls = _get_recent_tool_calls(messages)
+        if recent_calls:
+            lines.append("")
+            lines.append("--- RECENT TOOL CALLS (for follow-up context) ---")
+            for call in recent_calls:
+                lines.append(f"Tool: {call['name']}")
+                lines.append(f"Args: {json.dumps(call['args'], indent=2)}")
+            lines.append("For follow-up queries, reuse these same parameters. Only change what the user explicitly asks about.")
+            lines.append("--------------------------------------------------")
+        elif summary:
+            lines.append("")
+            lines.append("--- PREVIOUS CONVERSATION CONTEXT ---")
+            lines.append(summary)
+            lines.append("--------------------------------------------------")
+        # Inject last_tool_call for tools not already covered by recent_calls
+        if last_tool_call:
+            recent_names = {c["name"] for c in recent_calls} if recent_calls else set()
+            extra = {k: v for k, v in last_tool_call.items() if k not in recent_names}
+            if extra:
+                lines.append("")
+                lines.append("--- PREVIOUS TOOL CALLS (from earlier in conversation) ---")
+                lines.append(json.dumps(extra, indent=2))
+                lines.append("For follow-up queries, reuse these same parameters. Only change what the user explicitly asks about.")
+                lines.append("--------------------------------------------------")
     if selected_tools:
         lines.append("")
         lines.append(f"You MUST call ALL {len(selected_tools)} tools: {', '.join(selected_tools)}")
@@ -508,10 +616,6 @@ def build_system_prompt(
             meta = TOOL_INTENT_REGISTRY.get(tool_name)
             if meta and meta.get("prompt_tips"):
                 lines.append(f"  {tool_name}: {meta['prompt_tips']}")
-    if summary:
-        lines.append("--- PREVIOUS CONVERSATION CONTEXT ---")
-        lines.append(summary)
-        lines.append("-------------------------------------")
     lines.append("")
     lines.append("Example:")
     lines.append("  user: show me b2b invoices for april 2024")
@@ -613,6 +717,7 @@ def normalize_tool_name(name: str) -> str:
     if not name:
         return ""
     name = str(name).strip()
+    name = name.replace(" ", "_")
     if "=" in name:
         name = name.split("=", 1)[0].strip()
     return TOOL_NAME_ALIASES.get(name, name)
@@ -812,6 +917,8 @@ async def chat_model_node(state: MainState):
             selected_tools=selected_tools,
             query_parts=query_parts,
             summary=summary,
+            messages=state.get("messages", []),
+            last_tool_call=state.get("last_tool_call"),
         )
 
         prompt_duration = time.perf_counter() - prompt_start
@@ -913,9 +1020,10 @@ async def chat_model_node(state: MainState):
                 elif isinstance(flds, str):
                     args["fields"] = [f.strip() for f in flds.split(",") if f.strip()]
 
-                # If LLM sent no fields, build from query triggers only (no force-added extras)
+                # If LLM sent no fields, build from query triggers only (no force-added extras).
+                # Use meta-level default_fields (not repair-level — repair is the sub-dict).
                 if "fields" not in args or not args.get("fields"):
-                    args["fields"] = list(repair.get("default_fields", ["name"]))
+                    args["fields"] = list(meta.get("default_fields", repair.get("default_fields", ["name"])))
 
                 # Clear term if it looks like a filter expression, not a product name
                 term = args.get("term")
@@ -932,10 +1040,24 @@ async def chat_model_node(state: MainState):
                     if v and re.match(r"\d{4}-\d{2}-\d{2}", str(v)):
                         worker_has[dk] = v
 
-            # Discard hallucinated dates: if LLM provided dates but the query
-            # has no date reference at all (neither YYYY-MM-DD nor a 4-digit year),
-            # they are invented — let defaults apply.
-            if worker_has and not re.search(r"\d{4}-\d{2}-\d{2}|\b\d{4}\b", combined_q):
+            # Discard hallucinated dates: if LLM provided dates but neither the query
+            # nor the conversation summary has a date reference, they are invented.
+            # Also check recent tool call context — follow-ups often reuse dates
+            # from previous calls without mentioning them in the query text.
+            summary_text = state.get("summary", "") or ""
+            messages_list = state.get("messages", [])
+            recent_tool_dates = ""
+            for msg in reversed(messages_list[:-1]):
+                if hasattr(msg, "tool_calls") and msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        tc_args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
+                        for dk in ("from_date", "to_date"):
+                            dv = tc_args.get(dk, "") if isinstance(tc_args, dict) else ""
+                            if dv:
+                                recent_tool_dates += " " + str(dv)
+                    if recent_tool_dates.strip():
+                        break
+            if worker_has and not re.search(r"\d{4}-\d{2}-\d{2}|\b\d{4}\b", combined_q + " " + summary_text + recent_tool_dates):
                 worker_has = {}
 
             # Preserve worker's explicit non-standard params before overwrite.
@@ -1304,7 +1426,7 @@ async def chat_model_node(state: MainState):
                 tool_calls.append({
                     "name": repaired["name"],
                     "args": repaired["args"],
-                    "id": f"call_{repaired['name']}",
+                    "id": f"call_{repaired['name']}_{uuid.uuid4().hex[:12]}",
                     "type": "tool_call",
                 })
 
@@ -1485,7 +1607,7 @@ def get_tool_name(tool_message, messages):
     return "unknown_tool"
 
 
-def make_summary(data: dict, errors: list, unsupported_parts: list | None = None) -> str:
+def make_summary(data: dict, errors: list, unsupported_parts: list | None = None, total_rows: int = 0) -> str:
     parts = []
 
     for tool_name, records in data.items():
@@ -1497,6 +1619,9 @@ def make_summary(data: dict, errors: list, unsupported_parts: list | None = None
             parts.append(f"{tool_name}: found 1 record")
         else:
             parts.append(f"{tool_name}: found {count} records")
+
+    if total_rows > 0:
+        parts.append(f"total_rows: {total_rows}")
 
     if errors:
         parts.append(f"{len(errors)} error(s)")
@@ -1700,6 +1825,11 @@ def filter_gst_records_by_query(records: list[dict], query: str) -> list[dict]:
 
     requested_set = set(requested)
 
+    has_category = any(isinstance(r,dict) and "category" in r for r in records)
+    if not has_category:
+        return records
+    
+    requested_set = set(requested)
     return [
         record for record in records
         if isinstance(record, dict) and record.get("category") in requested_set
@@ -1721,10 +1851,18 @@ async def deterministic_final_node(state: MainState):
     data = {}
     tools_used = []
     errors = []
+    total_rows = 0
     current_tool_call_ids = set()
+    # Accumulate tool calls across rounds — start from existing state
+    last_tool_call = dict(state.get("last_tool_call", {}))
     for msg in reversed(messages):
         if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
             current_tool_call_ids = {tc.get("id") for tc in msg.tool_calls if tc.get("id")}
+            for tc in msg.tool_calls:
+                name = tc.get("name")
+                args = tc.get("args")
+                if name and args:
+                    last_tool_call[name] = args  # overwrite with latest args for this tool
             break
     tool_messages = [
         msg for msg in messages
@@ -1775,6 +1913,9 @@ async def deterministic_final_node(state: MainState):
 
         if not isinstance(records, list):
             records = [records]
+
+        if isinstance(parsed, dict):
+            total_rows = max(total_rows, parsed.get("total_rows", 0))
         if tool_name == "get_gst_summary":
             records = filter_gst_records_by_query(
                 records,
@@ -1842,9 +1983,12 @@ async def deterministic_final_node(state: MainState):
         "query": user_query,
         "tools_used": tools_used,
         "data": data,
-        "summary": make_summary(data, errors, unsupported_parts),
+        "summary": make_summary(data, errors, unsupported_parts, total_rows),
         "errors": errors,
     }
+
+    if total_rows > 0:
+        final_response["total_rows"] = total_rows
 
     if unsupported_parts:
         final_response["unsupported_parts"] = unsupported_parts
@@ -1852,6 +1996,7 @@ async def deterministic_final_node(state: MainState):
     return {
         "final_response": final_response,
         "tools_utilized": tools_used,
+        "last_tool_call": last_tool_call,
     }
 # ============================================
 # TOOL NODE
@@ -1885,6 +2030,22 @@ async def summarization_node(state: MainState):
 
         #We wille exclude system messages from the summary payload to save tokens
         messages_to_summarize = [m for m in messages[:cutoff_index] if not isinstance(m, SystemMessage)]
+
+        # Strip raw_response from tool messages to avoid blowing up summary LLM input
+        stripped_messages = []
+        for m in messages_to_summarize:
+            if isinstance(m, ToolMessage):
+                try:
+                    parsed = json.loads(m.content)
+                    if isinstance(parsed, dict) and "raw_response" in parsed:
+                        del parsed["raw_response"]
+                        stripped_messages.append(ToolMessage(content=json.dumps(parsed, ensure_ascii=False), tool_call_id=m.tool_call_id, name=m.name))
+                        continue
+                except Exception:
+                    pass
+            stripped_messages.append(m)
+        messages_to_summarize = stripped_messages
+        
         if not messages_to_summarize:
             return{}
         
@@ -1893,19 +2054,17 @@ async def summarization_node(state: MainState):
 
         summary_prompt = (
             f"You are an ERP assistant memory manager.\n"
-            f"PREVIOUS SUMMARY:\n{current_summary or '(none)'}\n\n"
-            f"NEW CONVERSATION:\n"
-            f"(see messages below)\n\n"
-            f"TASK: Write an updated summary that APPENDS the new information "
-            f"after the previous summary. Keep the previous summary text exactly as-is -- "
-            f"do NOT shorten, drop or rephrase anything from it. "
-            f"Only add new facts at the end."
+            f"TASK: Write a concise summary of the conversation below. "
+            f"Include key facts: which tools were called, what data was requested, "
+            f"and any important results or conclusions. "
+            f"Do NOT include raw data dumps — just the gist.\n\n"
+            f"CONVERSATION:\n"
         )
         summary_input = [SystemMessage(content=summary_prompt)] + messages_to_summarize
-        response = await summary_llm(summary_input)
+        response = await summary_llm.ainvoke(summary_input)
         new_summary = response.content
         if not new_summary:
-            new_summary = current_summary or ""
+            new_summary = ""
         MAX_SUMMARY_CHARS = 16000 #16000 characters will be roughly aroound 4000 tokens.
         if len(new_summary) > MAX_SUMMARY_CHARS:
             tail = new_summary[-MAX_SUMMARY_CHARS:]
@@ -1928,3 +2087,92 @@ async def summarization_node(state: MainState):
         return {
             "summary": current_summary or "",
         }
+    
+@traceable(name="response_generation_node", run_type="chain")
+async def response_generation_node(state: MainState):
+    """
+    Generates a Natural-Language response that mirrors the user's language.
+    Falls back to format_response_as_chat_text on any LLM failure. 
+    """
+    final_response = state.get("final_response", {})
+    messages = state.get("messages", [])
+
+    original_query = (
+                        state.get("original_query", "")
+                        or state.get("user_query", "")
+                        or ""
+                    )
+    if not original_query:
+        for msg in reversed(messages):
+            if isinstance(msg,HumanMessage):
+                original_query = getattr(msg,"content","") or ""
+                break
+    detected_language = state.get("detected_language") or "auto"
+
+    # Fallback: if detected_language is english/mixed but query has Hinglish words, override
+    if detected_language not in ("hinglish", "hindi"):
+        hinglish_words = {"batao", "chaia", "wale", "ka", "ki", "kya", "hai", "kitne", "konse", "konsa", "karli", "hua", "hue"}
+        if any(w in original_query.lower().split() for w in hinglish_words):
+            detected_language = "hinglish"
+
+    system_prompt = (
+        "You are an ERP assistant. Write a SHORT natural conversational reply using ONLY the tool results below.\n"
+        "HARD RULES:\n"
+    )
+    if detected_language == "hinglish":
+        system_prompt += (
+            "1. LANGUAGE: The user wrote in Hinglish (Hindi words written with English letters).\n"
+            "   Your ENTIRE reply MUST use ONLY a-z A-Z 0-9 and basic punctuation (. , ? !).\n"
+            "   Do NOT use Devanagari (Hindi script), Chinese, or any other non-Latin characters.\n"
+            "   Write Hindi words with English letters: 'aap', 'hai', 'nahi', 'se', 'ka', 'kaunsa'.\n"
+            "   Use the exact same words the user used when possible.\n"
+            "\n"
+            "EXAMPLE:\n"
+            "  User: muje customer details chaie\n"
+            "  Tool result: Customer name: Rohan\n"
+            "  Correct reply: aapke customer Rohan hai\n"
+            "  WRONG: आपके ग्राहक रोहन हैं (NO Devanagari at all)\n"
+        )
+    elif detected_language == "hindi":
+        system_prompt += (
+            "1. LANGUAGE: The user wrote in Hindi (Devanagari script). Reply in Hindi Devanagari.\n"
+        )
+    else:
+        system_prompt += (
+            "1. LANGUAGE: The user wrote in English. Reply in English.\n"
+        )
+    system_prompt += (
+        "2. NEVER invent field names, values, IDs, or numbers. If a value is missing, say so plainly.\n"
+        "3. Do NOT use headers like '--- Customers ---' or '--- Results ---' or any section labels.\n"
+        "4. Do NOT use bullet points or numbered lists unless the user explicitly asked for a list.\n"
+        "5. Keep the reply to 1-4 short sentences.\n"
+    )
+    human_prompt = (
+        f"USER QUERY:\n{original_query}\n\n"
+        f"TOOL RESULTS (JSON):\n{json.dumps(final_response, indent=2, ensure_ascii=False)}\n\n"
+        f"Summary : {final_response.get('summary','')}\n\n"
+    )
+
+    try:
+        response = await summary_llm.ainvoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=human_prompt),
+        ])
+        response_text = (getattr(response, "content", "") or "").strip()
+        if not response_text:
+            raise ValueError("Empty response from LLM")
+    except Exception as e:
+        print(f"Error in response generation node: {e}")
+        # Inline fallback instead of calling format_response_as_chat_text (not imported here)
+        data = final_response.get("data", {}) if isinstance(final_response, dict) else {}
+        summary = final_response.get("summary", "") if isinstance(final_response, dict) else str(final_response)
+        lines = [summary] if summary else []
+        for tool_name, records in data.items() if isinstance(data, dict) else []:
+            if records:
+                lines.append(f"\n{tool_name}:")
+                for r in records[:10] if isinstance(records, list) else [records]:
+                    if isinstance(r, dict):
+                        parts = [f"{k}={v}" for k, v in r.items()]
+                        lines.append("  " + ", ".join(parts))
+        response_text = "\n".join(lines) if lines else str(final_response)
+    return {"response_text": response_text}

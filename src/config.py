@@ -5,6 +5,7 @@ import os
 import yaml
 from langchain_ollama import OllamaEmbeddings, ChatOllama
 
+
 embedding_model = OllamaEmbeddings(model="bge-m3")
 
 normalizer_llm = ChatOllama(
