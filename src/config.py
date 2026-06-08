@@ -3,52 +3,42 @@ load_dotenv()
 
 import os  # noqa: E402
 import yaml  # noqa: E402
-# from langchain_ollama import OllamaEmbeddings, ChatOllama
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings  # noqa: E402
+from langchain_ollama import ChatOllama  # noqa: E402
+from langchain_openai import OpenAIEmbeddings  # noqa: E402
 
 embedding_model = OpenAIEmbeddings(
     model=os.getenv("EMB_MODEL"),
-    base_url= os.getenv("BASE_URL"),
+    base_url= os.getenv("BASE_URL") + "/v1",
     api_key= os.getenv("MODEL_API_KEY"),
     timeout=180,
     check_embedding_ctx_length=False,
 )
 
-normalizer_llm = ChatOpenAI(
+normalizer_llm = ChatOllama(
     model=os.getenv("TRANS_LLM_MODEL"),
-    base_url= os.getenv("BASE_URL"),
-    api_key= os.getenv("MODEL_API_KEY"),
     temperature=0.0,
-    max_tokens=256,
+    num_predict=256,
     timeout=60,
-
-    extra_body={
-        "keep_alive": "30m",
-    },
+    keep_alive="30m",
+    reasoning=False,
 )
-llm = ChatOpenAI(
-    model= os.getenv("LLM_MODEL") ,
-    base_url= os.getenv("BASE_URL"),
-    api_key= os.getenv("MODEL_API_KEY"),
-    temperature=0.0,
-    max_tokens=4096,
-    timeout=120,
 
-    extra_body={
-        "keep_alive": "30m",
-    },
+llm = ChatOllama(
+    model=os.getenv("LLM_MODEL"),
+    temperature=0.0,
+    num_predict=4096,
+    timeout=120,
+    keep_alive="30m",
+    reasoning=False,
 )
-summary_llm = ChatOpenAI(
-    model= os.getenv("SUMMARY_LLM_MODEL") ,
-    base_url= os.getenv("BASE_URL"),
-    api_key= os.getenv("MODEL_API_KEY"),
-    temperature=0.0,
-    max_tokens=4096,
-    timeout=120,
 
-    extra_body={
-        "keep_alive": "30m",
-    },
+summary_llm = ChatOllama(
+    model=os.getenv("SUMMARY_LLM_MODEL"),
+    temperature=0.0,
+    num_predict=4096,
+    timeout=120,
+    keep_alive="30m",
+    reasoning=False,
 )
 
 print("LLM and embedding model initialised!")

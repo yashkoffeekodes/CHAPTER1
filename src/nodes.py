@@ -57,9 +57,87 @@ def get_cross_encoder():
 def now():
     return time.perf_counter()
 
+
+def _levenshtein(a: str, b: str) -> int:
+    if len(a) < len(b):
+        a, b = b, a
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a):
+        curr = [i + 1]
+        for j, cb in enumerate(b):
+            cost = 0 if ca == cb else 1
+            curr.append(min(curr[j] + 1, prev[j + 1] + 1, prev[j] + cost))
+        prev = curr
+    return prev[-1]
+
+
+def _preserve_proper_nouns(original: str, canonical: str) -> str:
+    if not original or not canonical:
+        return canonical
+    orig_words = re.findall(r"\w+", original)
+    orig_lowered = [(w, w.lower()) for w in orig_words]
+    result_words = []
+    for cw in re.findall(r"\w+", canonical):
+        cw_lower = cw.lower()
+        replacement = cw
+        if len(cw_lower) > 2:
+            for ow, ow_lower in orig_lowered:
+                if len(ow_lower) <= 2:
+                    continue
+                if cw_lower == ow_lower:
+                    replacement = ow
+                    break
+                if _levenshtein(cw_lower, ow_lower) == 1:
+                    replacement = ow
+                    break
+        result_words.append(replacement)
+    return " ".join(result_words)
+
+
+def _deduplicate_canonical(original: str, canonical: str) -> str:
+    """Remove duplicate tokens in canonical that appear more than in original."""
+    if not original or not canonical:
+        return canonical
+    orig_tokens = re.findall(r"\w+", original.lower())
+    orig_counts = {}
+    for t in orig_tokens:
+        orig_counts[t] = orig_counts.get(t, 0) + 1
+    canon_tokens = re.findall(r"\w+", canonical)
+    result = []
+    canon_counts = {}
+    for ct in canon_tokens:
+        ct_lower = ct.lower()
+        canon_counts[ct_lower] = canon_counts.get(ct_lower, 0) + 1
+        max_expected = orig_counts.get(ct_lower, 0)
+        if max_expected == 0:
+            max_expected = 1
+        if canon_counts[ct_lower] > max_expected:
+            continue
+        result.append(ct)
+    return " ".join(result)
+
+
+def _restore_negative_numbers(original: str, canonical: str) -> str:
+    """Restore negative signs on numbers where translator dropped them."""
+    if not original or not canonical:
+        return canonical
+    orig_negatives = re.findall(r"-(\d+)", original)
+    for num_str in orig_negatives:
+        pattern = re.compile(r"(?<!\w)" + re.escape(num_str) + r"(?!\w)")
+        canonical = pattern.sub("-" + num_str, canonical)
+    return canonical
+
+
 TRANSLATOR_PROMPT = """Normalize Hinglish/Hindi/Gujarati → clean English JSON.
 
 SCHEMA: {"canonical_query":"...","document_type":"sales_invoice|purchase_invoice|customer|product|general","language":"...","confidence":"high|medium|low","query_type":"erp_query|conversational|mixed"}
+
+CRITICAL — PRESERVE THESE EXACTLY:
+1. City names, company names, person names, and proper nouns. Do NOT respell or correct them.
+2. Negative signs on numbers (e.g. -5 stays -5, never becomes 5 or positive 5).
+3. Distinct abbreviations (b2b ≠ b2c, tds ≠ tcs). Never merge, duplicate, or swap them.
 
 WORD MAP: bill=sales_invoice, bikri=sales, kharidi=purchase, grahak=customer, rakam=amount, baki=outstanding, kam=less, zyada=greater, dikhao/batao=show, aur=and, kitne/kitna=how_many/much, hai/ho=is_are, kya=what, konse/konsa/jiska=which, kyu=why, chaia/chahiye=need, nahi=not, hamare/mera/uska/uski=our/my/his, wala/wale=with, sari/saari=all
 
@@ -75,7 +153,9 @@ A: {"canonical_query":"How many products in inventory","document_type":"product"
 Q: kyu nahi mila
 A: {"canonical_query":"Why no results found","document_type":"general","language":"hinglish","confidence":"high","query_type":"erp_query"}
 Q: hamne sabse pehle kya pucha tha
-A: {"canonical_query":"What was asked first by us","document_type":"general","language":"hinglish","confidence":"high","query_type":"conversational"}"""
+A: {"canonical_query":"What was asked first by us","document_type":"general","language":"hinglish","confidence":"high","query_type":"conversational"}
+Q: maine abhi kya pucha tha
+A: {"canonical_query":"What did I just ask","document_type":"general","language":"hinglish","confidence":"high","query_type":"conversational"}"""
 def is_plain_english_query(query: str) -> bool:
     """
     Returns True when the query looks like normal English.
@@ -184,6 +264,7 @@ async def translator_node(state: MainState) -> MainState:
         print("Translator node triggered")
 
         user_query = state.get("user_query", "") or ""
+        user_query = re.sub(r"[\])}\-]+$", "", user_query.strip())
 
         if not user_query:
             return {
@@ -221,6 +302,9 @@ async def translator_node(state: MainState) -> MainState:
             data = extract_json_object(response.content)
 
             canonical_query = data.get("canonical_query") or user_query
+            canonical_query = _preserve_proper_nouns(user_query, canonical_query)
+            canonical_query = _deduplicate_canonical(user_query, canonical_query)
+            canonical_query = _restore_negative_numbers(user_query, canonical_query)
             language = data.get("language", "mixed")
             confidence = data.get("confidence", "medium")
             query_type = data.get("query_type", "")
@@ -756,7 +840,7 @@ def build_system_prompt(
         "You are an ERP assistant. Use the available tools to answer the user.",
         'Preserve all query text literally. Do not reinterpret or assume intent. If user says "mars" use "mars", not March.',
         "Never invent IDs, names, dates, or amounts.",
-        "You MUST call at least one tool. Never answer in prose without a tool call.",
+        "You MUST call at least one tool. CRITICAL: Never answer in prose without a tool call. If you answer in text without calling a tool, the system will retry and your response will be discarded.",
         "Do NOT output any thinking or reasoning — call the tool directly.",
         "Set `fields` to only the columns the user explicitly asks for. "
         'E.g. "sirf name" → fields=["name"]; "name and cgst" → fields=["name","cgst"]. '
@@ -828,6 +912,8 @@ def build_system_prompt(
     lines.append("  2. `filters` is for exact matches only: hsnCode, category, lowStockOnly, etc.")
     lines.append("  3. Tools without `search`/`term` (gst_summary, tds, tcs): `filters` is correct usage.")
     lines.append("  4. CRITICAL — NEVER copy parameters between different tools. Each tool has its own unique set of valid parameters. What works for one tool will NOT work for another.")
+    lines.append("  5. When a query specifies BOTH an upper AND lower bound (e.g. 'stock >5 and <8', 'qty 5 se jyada aur 8 se kam'), ALWAYS include BOTH conditions in the filters dict (e.g. closingQty: {gt: 5, lt: 8}). Never drop one condition.")
+    lines.append("  6. When user says 'sara'/'saari'/'sare'/'all'/'full' (meaning all fields), OMIT the `fields` parameter entirely so the API returns ALL available columns.")
 
     return "\n".join(lines)
 

@@ -34,7 +34,7 @@ class MainState(TypedDict):
     memory_answer: str  # stores memory-only query answer so routing can continue to response_generation
     original_query: str  # stores the original user query before canonicalization
     unsupported_reason: str  # stores reason when query is out of domain
-    
+    query_type : str
 class OutputState(TypedDict):
     final_response: str
     tools_utilized: List[str]
