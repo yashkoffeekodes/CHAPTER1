@@ -2629,7 +2629,10 @@ async def response_generation_node(state: MainState):
         "4. Do NOT use headers like '--- Customers ---' or '--- Results ---' or any section labels.\n"
         "5. Do NOT use bullet points or numbered lists unless the user explicitly asked for a list.\n"
         "6. Keep the reply to 1-4 short sentences.\n"
-        "7. If the TOOL RESULTS contain a '__note' saying records are hidden. "
+        "7. ALWAYS mention the specific amounts/values/numbers from the tool results. "
+        "Never omit numeric data. If the result shows 'taxableAmount: 246261.38', say 'taxable amount 2.46 lakh' not just 'data mil gaya'. "
+        "WRONG: 'B2B GST data hai.' CORRECT: 'B2B GST ka taxable amount 2.46 lakh hai, jisme IGST 44,327 hai aur CGST/SGST 22,164 hai.'\n"
+        "8. If the TOOL RESULTS contain a '__note' saying records are hidden. "
         "you do NOT have access to change those records. DO NOT guess or invent them. "
         "Tell the user: 'i can only show the records i have given you.Pleace give a specific filter or query to see the other records.'\n"
     )
