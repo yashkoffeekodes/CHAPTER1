@@ -1,16 +1,17 @@
 from langsmith import traceable
-import requests
 from typing import Any, Optional
 import time
-from src.config import CHP1_API_BASE_URL, CHP1_API_TIMEOUT,CHP1_API_TOKEN
+from src.config import CHP1_API_BASE_URL, CHP1_API_TIMEOUT, CHP1_API_TOKEN
 import httpx
+
+_http_client = httpx.AsyncClient(timeout=CHP1_API_TIMEOUT)
 
 def build_url(endpoint: str) -> str:
     base_url = CHP1_API_BASE_URL.rstrip("/")
     endpoint = endpoint.strip("/")
     return f"{base_url}/{endpoint}"
 
-def parse_response(response: requests.Response) -> dict[str, Any]:
+def parse_response(response: httpx.Response) -> dict[str, Any]:
     try:
         payload = response.json()
     except Exception:
@@ -62,21 +63,11 @@ async def api_post(endpoint: str, body: Optional[dict[str, Any]] = None) -> dict
 
         request_start = time.perf_counter()
 
-        async with httpx.AsyncClient(timeout=CHP1_API_TIMEOUT) as client:
-            response = await client.post(
-                url,
-                json=final_body,
-                headers={"Authorization": f"{CHP1_API_TOKEN}"}
-            )
-
-
-
-        # response = requests.post(
-        #                         url,    
-        #                         json=final_body,
-        #                         headers={"Authorization": f"{CHP1_API_TOKEN}"},
-        #                         timeout=CHP1_API_TIMEOUT,
-        #                     )
+        response = await _http_client.post(
+            url,
+            json=final_body,
+            headers={"Authorization": f"{CHP1_API_TOKEN}"}
+        )
 
         request_duration = time.perf_counter() - request_start
 

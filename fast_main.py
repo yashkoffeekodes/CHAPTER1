@@ -62,18 +62,19 @@ def should_cache_final_response(result: dict) -> bool:
     if not isinstance(result, dict):
         return False
 
+    response_text = result.get("response_text")
+    if isinstance(response_text, str) and response_text.strip():
+        return True
+
     response = result.get("response")
-    if not isinstance(response, dict):
-        return False
+    if isinstance(response, dict):
+        success = response.get("success")
+        status = response.get("status")
+        tools_used = response.get("tools_used", [])
+        if tools_used and success is True and status == "success":
+            return True
 
-    success = response.get("success")
-    status = response.get("status")
-    tools_used = response.get("tools_used", [])
-
-    if not tools_used:
-        return False
-
-    return success is True and status == "success"
+    return False
 
 
 async def get_cached_final_response(query: str):
@@ -113,9 +114,10 @@ async def set_cached_final_response(query: str, result: dict):
 
     key = normalize_query_for_cache(query)
 
-    # Cache only API output payload, never session-specific LangChain messages.
     cacheable_result = {
+        "response_text": result.get("response_text"),
         "response": result.get("response"),
+        "data": result.get("data", {}),
         "timings": result.get("timings", []),
         "total_time_sec": result.get("total_time_sec", 0.0),
     }

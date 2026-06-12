@@ -18,6 +18,7 @@ TCS_OUTSTANDING_ENDPOINT = "/reports/tcs-outstanding"
 api_cache_maxsize = 100  # Max number of cached entries
 api_cache_ttl_secs = 600  # 10 minutes
 api_cache = OrderedDict()  # Cache dict to store API responses with insertion order
+api_cache_lock = asyncio.Lock()  # Protects cache from concurrent async access
 
 
 def make_cache_key(endpoint: str, body: dict) -> str:
@@ -31,30 +32,27 @@ async def cached_api_post(endpoint: str, body: dict) -> dict:
     """
 
     cache_key = make_cache_key(endpoint, body)
-    now = time.monotonic()
 
-    cached = api_cache.get(cache_key)
-
-    if cached:
-        cached_at = cached["cached_at"]
-        age = now - cached_at
-
-        if age <= api_cache_ttl_secs:
-            print(f"[CACHE HIT] {endpoint}")
-            return copy.deepcopy(cached["result"])
-
-        print(f"[CACHE EXPIRED] {endpoint}")
-        api_cache.pop(cache_key, None)
+    async with api_cache_lock:
+        cached = api_cache.get(cache_key)
+        if cached:
+            age = time.monotonic() - cached["cached_at"]
+            if age <= api_cache_ttl_secs:
+                print(f"[CACHE HIT] {endpoint}")
+                return copy.deepcopy(cached["result"])
+            print(f"[CACHE EXPIRED] {endpoint}")
+            api_cache.pop(cache_key, None)
 
     print(f"[CACHE MISS] {endpoint}")
     result = await api_post(endpoint, body=body)
 
-    api_cache[cache_key] = {
-        "cached_at": now,
-        "result": copy.deepcopy(result),
-    }
-    while len(api_cache) >= api_cache_maxsize:
-        api_cache.popitem(last=False)
+    async with api_cache_lock:
+        api_cache[cache_key] = {
+            "cached_at": time.monotonic(),
+            "result": copy.deepcopy(result),
+        }
+        while len(api_cache) >= api_cache_maxsize:
+            api_cache.popitem(last=False)
     return copy.deepcopy(result)
 
 def normalize_fields(fields):
@@ -708,6 +706,22 @@ tools = [
     get_gst_summary,
     get_tds_outstanding,
     get_tcs_outstanding,
+<<<<<<< Updated upstream
+=======
+    get_top_products,
+    get_popular_products,
+    get_slow_moving_products,
+    get_sales_summary,
+    get_sales_trend,
+    get_top_customer,
+    get_top_vendor,
+    get_purchase_summary,
+    get_search_ledgers,
+    get_search_vendors,
+    get_outstanding_sales_invoices,
+    get_outstanding_purchase_invoices,
+    get_overdue_invoices,
+>>>>>>> Stashed changes
 ]
 
 tools_dict = {tool.name: tool for tool in tools}

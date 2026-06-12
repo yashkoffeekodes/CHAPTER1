@@ -46,8 +46,10 @@ print("LLM and embedding model initialised!")
 # ── API config (env vars) ──
 CHP1_API_BASE_URL = os.getenv("CHP1_API_BASE_URL", "")
 CHP1_API_TOKEN = os.getenv("CHP1_API_TOKEN", "")
-CHP1_API_TIMEOUT = int(os.getenv("CHP1_API_TIMEOUT", ""))
-COMPANY_ID = int(os.getenv("COMPANY_ID", ""))
+_timeout_raw = os.getenv("CHP1_API_TIMEOUT")
+CHP1_API_TIMEOUT = int(_timeout_raw) if _timeout_raw else 10
+_company_raw = os.getenv("COMPANY_ID")
+COMPANY_ID = int(_company_raw) if _company_raw else 0
 
 # ── Pipeline config (YAML — edit config.yaml, not Python) ──
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.yaml")
