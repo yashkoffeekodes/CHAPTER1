@@ -1045,7 +1045,7 @@ async def get_customer(
 
     Args:
         search: Customer name or party name (substring match). Use empty string "" to return ALL customers.
-            Do NOT pass concepts like "outside india" or city names as search; those are not customer names.
+            When user asks about customers in a specific city/area, pass the city/area name as `search` param to find matching customers.
         limit: Number of records to fetch. Default is 100.
     """
 

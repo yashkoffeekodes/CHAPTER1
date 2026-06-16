@@ -14,18 +14,19 @@ embedding_model = OpenAIEmbeddings(
     check_embedding_ctx_length=False,
 )
 
-normalizer_llm = ChatOpenAI(
-    model=os.getenv("TRANS_LLM_MODEL"),
-    base_url= os.getenv("TRANS_BASE_URL"),
-    api_key= os.getenv("TRANS_MODEL_API_KEY"),
-    temperature=0.0,
-    max_tokens=256,
-    timeout=60,
-
-    extra_body={
-        "keep_alive": "5m",
-    },
-)
+# ── Translator LLM (disabled — 27B worker handles raw Hinglish directly) ──
+# normalizer_llm = ChatOpenAI(
+#     model=os.getenv("TRANS_LLM_MODEL"),
+#     base_url= os.getenv("TRANS_BASE_URL"),
+#     api_key= os.getenv("TRANS_MODEL_API_KEY"),
+#     temperature=0.0,
+#     max_tokens=256,
+#     timeout=60,
+#
+#     extra_body={
+#         "keep_alive": "5m",
+#     },
+# )
 llm = ChatOpenAI(
     model= os.getenv("LLM_MODEL") ,
     base_url= os.getenv("LLM_BASE_URL"),
@@ -34,10 +35,6 @@ llm = ChatOpenAI(
     max_tokens=4096,
     timeout=120,
     disable_streaming="tool_calling",
-
-    extra_body={
-        "keep_alive": "5m",
-    },
 )
 summary_llm = ChatOpenAI(
     model= os.getenv("SUMMARY_LLM_MODEL") ,
@@ -46,10 +43,6 @@ summary_llm = ChatOpenAI(
     temperature=0.7,
     max_tokens=4096,
     timeout=120,
-
-    extra_body={
-        "keep_alive": "5m",
-    },
 )
 
 print(f"LLM model loaded: {llm.model}")

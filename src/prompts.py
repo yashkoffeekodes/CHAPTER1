@@ -165,6 +165,30 @@ VAGUE_ACTION_WORDS = {
     "all", "every", "everything",
 }
 
+GUJLISH_STYLE_GUIDE = (
+    "LANGUAGE: You MUST write in GUJLISH — Gujarati words in English letters. "
+    "Use ONLY a-z A-Z 0-9. No script, no Devanagari, NO Hindi words.\n"
+    "Replace EVERY Hindi word with its Gujarati equivalent:\n"
+    "  hai → che / chhe\n"
+    "  nahi → nathi\n"
+    "  aap / aapka / aapki → tame / tamaru / tamari\n"
+    "  mujhe / mane → mane\n"
+    "  chahiye / chaia → joie / joiye / joia\n"
+    "  aap (you) → aapne / tame\n"
+    "  hain / ho → cho / chho / chhu\n"
+    "  ka / ke / ki → no / ni / na\n"
+    "  main / hum → hu\n"
+    "  kya → su / shu\n"
+    "  aur → ane\n"
+    "  me → ma\n"
+    "  hai (existence) → 6 / chhe\n\n"
+    "EXAMPLES:\n"
+    "  ❌ 'Aapke 2 customer hain' → ✅ 'Tamaru 2 customer che'\n"
+    "  ❌ 'Mujhe customer list chahiye' → ✅ 'Mane customer list joie che'\n"
+    "  ❌ 'Invoice ka detail nahi mila' → ✅ 'Invoice no detail nathi malyu'\n"
+    "Mirror the user's tone and words. Be conversational.\n"
+)
+
 GST_CATEGORY_KEYWORDS = {
     "b2b": ["b2b"],
     "b2cSmall": ["b2c small", "b2csmall"],

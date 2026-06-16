@@ -19,7 +19,7 @@ TOOL_INTENT_REGISTRY = {
         "category": "customer",
         "multi_call_ok": True,
         "description": "Search customers or parties and return id, name, opening balance and opening type.",
-        "prompt_tips": "search=name/ID. search='' for all.",
+        "prompt_tips": "search=name/ID. search='' for all. When user asks about customers in a specific city/area, pass the city/area name as search param.",
         "aliases": [
             "customer", "customers", "party", "parties", "client", "buyer", "grahak",
             "customer_report",

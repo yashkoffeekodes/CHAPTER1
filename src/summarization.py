@@ -37,7 +37,7 @@ async def summarization_node(state: MainState):
             f"/no_think\n"
         )
         summary_input = [SystemMessage(content=summary_prompt)] + messages_to_summarize
-        log_prompt("summarization", str(summary_input))
+        # log_prompt("summarization", str(summary_input))
         response = await summary_llm.ainvoke(summary_input)
         log_token_usage(response, "summarization", input_text=str(summary_input), output_text=response.content)
         new_summary = response.content

@@ -34,7 +34,8 @@ async def _timeout_iterate(agen, timeout):
         raise TimeoutError()
 
 from src.graph import graph_builder
-from src.config import llm, normalizer_llm, get_cfg
+# from src.config import llm, normalizer_llm, get_cfg  # normalizer_llm disabled — 27B worker handles raw Hinglish
+from src.config import llm, get_cfg
 import session_store
 
 @asynccontextmanager

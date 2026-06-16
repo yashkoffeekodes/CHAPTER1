@@ -5,7 +5,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from src.schema import MainState
 from src.config import summary_llm
 from src.utils import LIST_WORDS, TOOL_DOMAINS, strip_think_tags, log_token_usage, log_prompt, _get_tokenizer
-from src.prompts import HINGLISH_PRONOUNS
+from src.prompts import HINGLISH_PRONOUNS, GUJLISH_STYLE_GUIDE
 from src.deterministic_final import make_summary
 
 
@@ -106,14 +106,6 @@ async def response_generation_node(state: MainState):
             if isinstance(msg, HumanMessage):
                 original_query = getattr(msg, "content", "") or ""
                 break
-    detected_language = state.get("detected_language") or "auto"
-
-    if detected_language not in ("hinglish", "hindi"):
-        hinglish_words = {"batao", "chaia", "wale", "ka", "ki", "kya", "hai", "kitne", "konse", "konsa", "karli", "hua", "hue"}
-        tokens = re.findall(r"\w+", original_query.lower())
-        if any(w in tokens for w in hinglish_words):
-            detected_language = "hinglish"
-
     previous_summary = state.get("summary", "") or ""
     conversation_context = state.get("conversation_context", {})
 
@@ -122,27 +114,43 @@ async def response_generation_node(state: MainState):
         original_query, re.IGNORECASE
     ))
 
+    detected_language = state.get("detected_language") or "auto"
+    if detected_language not in ("hinglish", "hindi", "gujarati"):
+        q = original_query or ""
+        has_guj = any(0x0A80 <= ord(c) <= 0x0AFF for c in q)
+        has_dev = any(0x0900 <= ord(c) <= 0x097F for c in q)
+        tokens_q = set(re.findall(r"\w+", q.lower()))
+        gujlish_words = {"tamaru", "tamari", "che", "chhu", "chhe", "aapne", "su", "shu", "kyare", "kone", "maa", "athi", "pan", "pachi", "hoy", "karo", "kar", "joie", "nahi", "hatu", "hati"}
+        hinglish_words = {"batao", "chaia", "wale", "ka", "ki", "kya", "hai", "kitne", "konse", "konsa", "karli", "hua", "hue"}
+        if has_guj:
+            detected_language = "gujarati"
+        elif has_dev:
+            detected_language = "hindi"
+        elif tokens_q & gujlish_words:
+            detected_language = "gujarati"
+        elif tokens_q & hinglish_words:
+            detected_language = "hinglish"
+        else:
+            detected_language = "english"
+
     system_prompt = (
         "You are an ERP assistant. Reply using ONLY the tool results below.\n"
         "Vary your tone. Mirror the user's language. "
         "Never say 'As an AI'. No JSON/code/headings. "
         "If empty → 'data nahi mila'. Be conversational.\n"
     )
-    if previous_summary:
-        system_prompt += f"Background conversation:\n{previous_summary[:400]}\n\n"
-    if conversation_context:
-        entities = conversation_context.get("entities", [])
-        if entities:
-            system_prompt += f"KNOWN ENTITIES:\n{json.dumps(entities[-3:], indent=2, ensure_ascii=False)}\n\n"
 
-    mode_map = {"hinglish": "Hinglish (Hindi words in English letters)", "hindi": "Hinglish"}
-    lang_mode = mode_map.get(detected_language, "English")
-    system_prompt += (
-        "LANGUAGE: Reply in " + lang_mode + ". "
-        "Use ONLY a-z A-Z 0-9. No Devanagari. "
-        "Write Hindi with English letters (aap/hai/nahi). "
-        "Mirror the user's words.\n"
-    )
+    if detected_language == "gujarati":
+        system_prompt += GUJLISH_STYLE_GUIDE
+    elif detected_language in ("hinglish", "hindi"):
+        system_prompt += (
+            "LANGUAGE: Reply in Hinglish (Hindi words in English letters). "
+            "Use ONLY a-z A-Z 0-9. No Devanagari. "
+            "Write Hindi with English letters (aap/hai/nahi/ka). "
+            "Mirror the user's words and tone.\n"
+        )
+    else:
+        system_prompt += "LANGUAGE: Reply in English.\n"
 
     system_prompt += (
         "TOOL RESULTS are the ONLY truth — never invent fields/values. "
@@ -151,6 +159,13 @@ async def response_generation_node(state: MainState):
     )
 
     intent = state.get("query_intent", "sample")
+    if previous_summary:
+        system_prompt += f"Background conversation:\n{previous_summary[:400]}\n\n"
+    if conversation_context:
+        entities = conversation_context.get("entities", [])
+        if entities:
+            system_prompt += f"KNOWN ENTITIES:\n{json.dumps(entities[-3:], indent=2, ensure_ascii=False)}\n\n"
+
     if intent == "count":
         system_prompt += (
             "If truncated, mention total count. "
@@ -341,7 +356,7 @@ async def response_generation_node(state: MainState):
 
     try:
         full_content = ""
-        log_prompt("summary_llm", system_prompt + "\n" + human_prompt)
+        # log_prompt("summary_llm", system_prompt + "\n" + human_prompt)
         async for chunk in summary_llm.with_config({"tags": ["response_stream"]}).astream([
             SystemMessage(content=system_prompt),
             HumanMessage(content=human_prompt),

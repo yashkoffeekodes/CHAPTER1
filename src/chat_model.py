@@ -8,7 +8,7 @@ from langsmith import traceable
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage,ToolMessage
 from src.schema import MainState
 from src.tools_api import tools_dict
-from src.tool_doc import TOOL_INTENT_REGISTRY, TOOL_NAME_ALIASES
+from src.tool_doc import TOOL_INTENT_REGISTRY, TOOL_NAME_ALIASES, CITY_WORDS
 from src.config import llm, summary_llm
 from src.utils import (
     now, sec, log_token_usage, log_prompt, sanitize_tool_filters,
@@ -16,7 +16,7 @@ from src.utils import (
     extract_date_range_for_tool,strip_think_tags
 )
 from src.semantic_search import classify_domains
-from src.prompts import META_QUESTION_PATTERNS_GLOBAL, _REFERENCE_PATTERN
+from src.prompts import META_QUESTION_PATTERNS_GLOBAL, _REFERENCE_PATTERN, GUJLISH_STYLE_GUIDE
 
 SCOPE_WORDS = {
     "all", "every", "each",
@@ -153,10 +153,10 @@ CATEGORY_SUMMARIES: dict[str, tuple[str, str]] = {
 }
 
 _LANG_RULE = (
-    "Speak the same language the user used (English or Hinglish). "
-    "If Hindi/Hinglish, use ONLY a-z A-Z 0-9 and basic punctuation "
-    "— no Devanagari or non-Latin characters. "
-    "Write Hindi with English letters: 'aap', 'hai', 'nahi', 'ka'."
+    "Speak the same language the user used (English, Hinglish, or Gujlish). "
+    "Use ONLY a-z A-Z 0-9 and basic punctuation — no Devanagari or Gujarati script. "
+    "If Hindi/Hinglish, write with English letters: 'aap', 'hai', 'nahi', 'ka'. "
+    "If Gujarati/Gujlish, write with English letters: 'tamaru', 'che', 'aapne', 'chhe'."
 )
 
 def _build_capability_text() -> str:
@@ -187,12 +187,46 @@ def build_system_prompt(
     last_tool_call: dict | None = None,
     conversation_context: dict | None = None,
     original_query: str = "",
+    detected_language: str = "",
 ) -> str:
+    # ── 1. CORE RULES (static) ──
     lines = [
         "You are an ERP assistant. Be literal — no reinterpretation.",
         "Never invent IDs, names, dates, or amounts.",
         "Must call a tool. Never answer in prose. No thinking output.",
         "",
+    ]
+
+    # ── 2. LANGUAGE RULE (dynamic, early) ──
+    if not detected_language or detected_language == "auto":
+        combined = f"{original_query} {user_query}" if original_query else user_query
+        q_lower = combined.lower()
+        tokens = set(re.findall(r"\w+", q_lower))
+        hinglish_words = {"batao", "chaia", "wale", "ka", "ki", "kya", "hai", "kitne", "konse", "konsa", "karli", "hua", "hue"}
+        gujlish_words = {"tamaru", "tamari", "che", "chhu", "chhe", "aapne", "su", "shu", "kyare", "kone", "maa", "athi", "pan", "pachi", "hoy", "karo", "kar", "joie", "nahi", "hatu", "hati"}
+        if any(0x0A80 <= ord(c) <= 0x0AFF for c in combined):
+            detected_language = "gujarati"
+        elif any(0x0900 <= ord(c) <= 0x097F for c in combined):
+            detected_language = "hindi"
+        elif tokens & gujlish_words:
+            detected_language = "gujarati"
+        elif tokens & hinglish_words:
+            detected_language = "hinglish"
+        else:
+            detected_language = "english"
+    if detected_language == "gujarati":
+        lines.append(GUJLISH_STYLE_GUIDE)
+    elif detected_language in ("hinglish", "hindi"):
+        lines.append(
+            "LANGUAGE: Reply in Hinglish (Hindi words in English letters). "
+            "Use ONLY a-z A-Z 0-9. No Devanagari. "
+            "Write Hindi with English letters: 'aap', 'hai', 'nahi', 'ka'.\n"
+        )
+    else:
+        lines.append("LANGUAGE: Reply in English.\n")
+
+    # ── 3. ANTI-HALLUCINATION RULES (static) ──
+    lines += [
         "STRICT ANTI-HALLUCINATION RULES:",
         "- Never pass scope words (sab/saare/all/every/poore/saari) as search/term. They describe scope ('all'), not a name. For 'all records', call list without a search filter.",
         "- Never invent IDs/names. Use ONLY identifiers from prior tool results. If missing, call a list tool first — never guess.",
@@ -203,6 +237,39 @@ def build_system_prompt(
         "CRITICAL: Clear ALL params when switching tools — reuse only within same tool.",
     ]
 
+    # ── 4. SITUATIONAL HINTS (city, etc.) ──
+    combined_orig = f"{original_query} {user_query}" if original_query else user_query
+    q_upper = combined_orig.upper()
+    if any(city in q_upper for city in CITY_WORDS):
+        lines.append("")
+        lines.append("CITY HINT: The user query mentions a city name. "
+                      "For lookups by city, use search terms like '<city_name>' in relevant tool calls.")
+
+    # ── 5. AVAILABLE TOOLS + PROMPT_TIPS (before context) ──
+    if selected_tools:
+        lines.append("")
+        lines.append(f"Available tools: {', '.join(selected_tools)}")
+        lines.append("Call the tool(s) that are relevant to the query. You do NOT need to call every tool — only those that actually address the user's request.")
+        lines.append("")
+        lines.append("Tool rules:")
+        lines.append("  You may call the SAME tool MULTIPLE TIMES with different sort/filter arguments for different sub-requests.")
+        for tool_name in selected_tools:
+            meta = TOOL_INTENT_REGISTRY.get(tool_name)
+            if meta and meta.get("prompt_tips"):
+                lines.append(f"  {tool_name}: {meta['prompt_tips']}")
+
+    # ── 6. MULTI-INTENT (dynamic) ──
+    if query_parts and len(query_parts) > 1:
+        lines.append("")
+        lines.append("--- MULTI-INTENT QUERY ---")
+        lines.append(f"The user's query has {len(query_parts)} separate intents:")
+        for i, part in enumerate(query_parts, 1):
+            lines.append(f"  {i}. {part}")
+        lines.append("You MUST call a separate tool for each distinct intent. Do NOT combine different intents into one tool call.")
+        lines.append("Use the same parameters for follow-up parts, but call a new tool for each independent sub-query.")
+        lines.append("--------------------------")
+
+    # ── 7. CONTEXT SECTION (lower priority) ──
     check_query = f"{original_query} {user_query}" if original_query else user_query
     is_follow_up = bool(_REFERENCE_PATTERN.search(check_query)) or len(user_query.split()) <= 3
     if messages and is_follow_up:
@@ -245,26 +312,8 @@ def build_system_prompt(
                 lines.append(json.dumps(capped_extra))
                 lines.append("For follow-up queries, reuse these same parameters. Only change what the user explicitly asks about.")
                 lines.append("--------------------------------------------------")
-    if query_parts and len(query_parts) > 1:
-        lines.append("")
-        lines.append("--- MULTI-INTENT QUERY ---")
-        lines.append(f"The user's query has {len(query_parts)} separate intents:")
-        for i, part in enumerate(query_parts, 1):
-            lines.append(f"  {i}. {part}")
-        lines.append("You MUST call a separate tool for each distinct intent. Do NOT combine different intents into one tool call.")
-        lines.append("Use the same parameters for follow-up parts, but call a new tool for each independent sub-query.")
-        lines.append("--------------------------")
-    if selected_tools:
-        lines.append("")
-        lines.append(f"Available tools: {', '.join(selected_tools)}")
-        lines.append("Call the tool(s) that are relevant to the query. You do NOT need to call every tool — only those that actually address the user's request.")
-        lines.append("")
-        lines.append("Tool rules:")
-        lines.append("  You may call the SAME tool MULTIPLE TIMES with different sort/filter arguments for different sub-requests.")
-        for tool_name in selected_tools:
-            meta = TOOL_INTENT_REGISTRY.get(tool_name)
-            if meta and meta.get("prompt_tips"):
-                lines.append(f"  {tool_name}: {meta['prompt_tips']}")
+
+    # ── 8. FAILURE-AWARE + PARAMETER RULE (static, bottom) ──
     lines.append("")
     lines.append("FAILURE-AWARE:")
     lines.append("  If empty → say 'No records for X'. Acknowledge prior failures if any.")
@@ -348,12 +397,33 @@ async def chat_model_node(state: MainState):
 
             if query_type == "ambiguous":
                 caps_text = _build_capability_text()
+                detected_lang = state.get("detected_language") or "auto"
+                if detected_lang == "gujarati":
+                    lang_rule = (
+                        "LANGUAGE: Reply in GUJLISH only — Gujarati words written in English letters. "
+                        "Use ONLY a-z A-Z 0-9. No Gujarati script, no Devanagari, NO Hindi words. "
+                        "CRITICAL: Never use 'hai', 'aap', 'nahi', 'ka', 'ho', 'hain', 'hoga' — "
+                        "those are Hindi words. Use only Gujarati words like: "
+                        "'che' (not 'hai'), 'tamaru'/'tamari' (not 'aapka'), 'karo' (not 'kijiye'), "
+                        "'joie'/'joiye' (not 'chahiye'), 'aapne' (not 'aap'), 'mane' (not 'mujhe'), "
+                        "'chhe'/'chhu'. Example: 'Tamaru invoice che' not 'Aapka invoice hai'."
+                    )
+                elif detected_lang in ("hinglish", "hindi"):
+                    lang_rule = (
+                        "LANGUAGE: Reply in Hinglish (Hindi words in English letters). "
+                        "Use ONLY a-z A-Z 0-9. No Devanagari. "
+                        "Write Hindi with English letters like: 'aap', 'hai', 'nahi', 'ka'."
+                    )
+                else:
+                    lang_rule = "LANGUAGE: Reply in English.\n"
                 ambig_prompt = (
-                    "The user was unclear. Describe what you CAN help with "
-                    "in 2-3 friendly sentences with specific examples:\n"
+                    "First decide: is this about the user's business ERP data "
+                    "(customers, stock, GST, invoices, sales, TDS, vendors)?\n\n"
+                    "If YES → ask clarifying questions to understand what they need.\n"
+                    "If NO → politely say you cannot answer that, then list what I CAN help with:\n"
                     f"{caps_text}\n\n"
-                    f"{_LANG_RULE}\n"
-                    "End by asking what they want to look up.\n"
+                    f"{lang_rule}\n"
+                    "End by asking what they'd like to look up.\n"
                     "/no_think"
                 )
                 try:
@@ -485,6 +555,7 @@ async def chat_model_node(state: MainState):
             messages=state.get("messages", []),
             last_tool_call=state.get("last_tool_call"),
             conversation_context=state.get("conversation_context"),
+            detected_language=state.get("detected_language", ""),
         )
         prompt_duration = time.perf_counter() - prompt_start
         print(f"[4] Built system prompt: {prompt_duration:.3f}s")
@@ -554,7 +625,8 @@ async def chat_model_node(state: MainState):
             except Exception as schema_e:
                 print(f"[BIND_TOOLS] Error building schema preview: {schema_e}")
 
-            log_prompt("llm", str(loop_input))
+            # log_prompt("llm", str(loop_input))
+            print(f"[LANG] worker: {state.get('detected_language')}")
             try:
                 response = await llm.bind_tools(remaining_tools, strict=False).ainvoke(loop_input)
             except Exception as e:
